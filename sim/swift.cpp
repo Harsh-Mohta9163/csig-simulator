@@ -170,7 +170,7 @@ SwiftSubflowSrc::applySwiftLimits() {
 }
 
 void
-SwiftSubflowSrc::handle_ack(SwiftAck::seq_t ackno) {
+SwiftSubflowSrc::handle_ack(SwiftAck::seq_t ackno, bool packet_was_trimmed) {
     simtime_picosec now = eventlist().now();
     if (ackno > _last_acked) { // a brand new ack
         _RFC2988_RTO_timeout = now + _rto;// RFC 2988 5.3
@@ -250,7 +250,11 @@ SwiftSubflowSrc::handle_ack(SwiftAck::seq_t ackno) {
     // Not yet in fast recovery. What should we do instead?
     _dupacks++;
 
-    if (_dupacks!=3)  { // not yet serious worry
+    // If the packet was trimmed, bypass the 3-dup-ACK wait and jump straight
+    // into fast recovery immediately.  The _in_fast_recovery flag will then
+    // absorb all subsequent trimmed ACKs from the same burst, preventing a
+    // retransmission storm.
+    if (_dupacks != 3 && !packet_was_trimmed) { // not yet serious worry
         _src.log(this, SwiftLogger::SWIFT_RCV_DUP);
         applySwiftLimits();
         send_packets();
@@ -434,21 +438,17 @@ SwiftSubflowSrc::receivePacket(Packet& pkt)
     SwiftAck *p = (SwiftAck*)(&pkt);
     SwiftAck::seq_t ackno = p->ackno();
     SwiftAck::seq_t ds_ackno = p->ds_ackno();
+    bool packet_was_trimmed = p->is_trimmed();
     pkt.flow().logTraffic(pkt,*this,TrafficLogger::PKT_RCVDESTROY);
   
     ts_echo = p->ts_echo();
     p->free();
 
-    //cout << timeAsUs(eventlist().now()) << " " << nodename() << " recvack  " << ackno << " ts_echo " << timeAsUs(ts_echo) << endl;
-    //cout << timeAsUs(eventlist().now()) << " " << nodename() << " highest_sent was  " << _sub->_highest_sent << endl;
-
     if (ackno < _last_acked) {
-        //cout << "O seqno" << ackno << " last acked "<< _sub->_last_acked;
         return;
     }
 
     if (ackno==0){
-        //assert(!_sub->_established);
         _established = true;
     } else if (ackno>0 && !_established) {
         cout << "Should be _established " << ackno << endl;
@@ -456,12 +456,32 @@ SwiftSubflowSrc::receivePacket(Packet& pkt)
     }
 
     assert(ackno >= _last_acked);  // no dups or reordering allowed in this simple simulator
-    simtime_picosec delay = eventlist().now() - ts_echo;
-    adjust_cwnd(delay, ackno);
+
+    if (packet_was_trimmed) {
+        // Bypass delay math: the header arrived fast via the high-priority trim
+        // queue, so ts_echo reflects near-zero queuing — feeding it into
+        // adjust_cwnd() would make Swift think the network is empty and increase
+        // CWND.  Apply max-MDF penalty here instead.
+        simtime_picosec now = eventlist().now();
+        _can_decrease = (now - _last_decrease) >= _rtt;
+        if (_can_decrease) {
+            _swift_cwnd = _swift_cwnd * (1.0 - max_mdf());
+            _last_decrease = now;
+        }
+        applySwiftLimits();
+        _src.log(this, SwiftLogger::SWIFT_RCV_DUP_FASTXMIT);
+    } else {
+        // Standard path: full packet arrived, use its timestamp for delay measurement.
+        simtime_picosec delay = eventlist().now() - ts_echo;
+        adjust_cwnd(delay, ackno);
+    }
 
     _src.update_dsn_ack(ds_ackno);
 
-    handle_ack(ackno);
+    // Pass the trimmed flag into handle_ack so it can bypass the 3-dup-ACK
+    // wait and enter fast recovery immediately, while still using the state
+    // machine to prevent a retransmission storm on subsequent trimmed ACKs.
+    handle_ack(ackno, packet_was_trimmed);
 }
 
 void
@@ -535,7 +555,9 @@ void SwiftSubflowSrc::doNextEvent() {
         } else if (eventlist().now() - _last_decrease >= _rtt) {
             _swift_cwnd *= (1.0 -_src._max_mdf);
         }
-
+        // Enforce bounds, update _last_decrease, and recalculate pacing delay
+        // (Algorithm 1, lines 26-32: clamp + t_last_decrease + pacing must apply after all three cases)
+        applySwiftLimits();
         retransmit_packet();
     }
 }
@@ -559,9 +581,9 @@ SwiftSubflowSrc::move_path() {
         cout << nodename() << " cant move_path\n";
         return;
     }
-    _path_index++;
-    // if we've moved paths so often we've run out of paths, I want to know
-    assert(_path_index < _src._paths.size()); 
+    // Wrap path index rather than asserting -- PLB on long flows can exhaust
+    // a linear list; cycling back gives fresh entropy instead of crashing.
+    _path_index = (_path_index + 1) % _src._paths.size();
     Route* new_route = _src._paths[_path_index]->clone();
     new_route->push_back(_subflow_sink);
     _route = new_route;
@@ -600,6 +622,9 @@ SwiftSrc::SwiftSrc(SwiftRtxTimerScanner& rtx_scanner, SwiftLogger* logger, Traff
     _stopped = false;
     _app_limited = -1;
     _highest_dsn_sent = 0;
+    _start_time = 0;
+    _flow_finished = false;
+    _end_trigger = 0;
 
     // swift cc init
     _ai = 1.0;  // increase constant.  Value is a guess
@@ -744,14 +769,18 @@ SwiftSrc::connect(const Route& routeout, const Route& routeback, SwiftSink& sink
     sub->connect(sink, routeout, routeback, get_id(), _scheduler);
     _rtx_timer_scanner->registerSubflow(*sub);
     _sink=&sink;
+    _start_time = starttime;
 
-    eventlist().sourceIsPending(*this,starttime);
+    if (starttime != TRIGGER_START) {
+        eventlist().sourceIsPending(*this,starttime);
+    }
     // cout << "starttime " << timeAsUs(starttime) << endl;
 }
 
 void 
 SwiftSrc::multipath_connect(SwiftSink& sink, simtime_picosec starttime, uint32_t no_of_subflows) {
     _sink=&sink;
+    _start_time = starttime;
     for (uint32_t i = 0; i < no_of_subflows; i++) {
         SwiftSubflowSrc* subflow = new SwiftSubflowSrc(*this, _traffic_logger, _subs.size());
         _subs.push_back(subflow);
@@ -765,8 +794,20 @@ SwiftSrc::multipath_connect(SwiftSink& sink, simtime_picosec starttime, uint32_t
         subflow->connect(sink, *routeout, *routeback, get_id(), _scheduler);
         _rtx_timer_scanner->registerSubflow(*subflow);
     }
-    eventlist().sourceIsPending(*this,starttime);
+    if (starttime != TRIGGER_START) {
+        eventlist().sourceIsPending(*this,starttime);
+    }
     // cout << "starttime " << timeAsUs(starttime) << endl;
+}
+
+void SwiftSrc::activate() {
+    // Called from a trigger to start the flow
+    _start_time = eventlist().now();
+    startflow();
+}
+
+void SwiftSrc::set_end_trigger(Trigger& trigger) {
+    _end_trigger = &trigger;
 }
 
 #define ABS(X) ((X)>0?(X):-(X))
@@ -795,8 +836,19 @@ SwiftSrc::targetDelay(uint32_t cwnd, const Route& route) {
 
 void SwiftSrc::update_dsn_ack(SwiftAck::seq_t ds_ackno) {
     //cout << "Flow " << _name << " dsn ack " << ds_ackno << endl;
-    if (ds_ackno >= _flow_size){
-        cout << "Flow " << _name << " finished at " << timeAsUs(eventlist().now()) << " total bytes " << ds_ackno << endl;
+    if (ds_ackno >= _flow_size && !_flow_finished) {
+        _flow_finished = true;
+        simtime_picosec fct = eventlist().now() - _start_time;
+        // Output format: FCT <name> start_us <t> finish_us <t> fct_us <t> size_bytes <n>
+        cout << "FCT " << _name
+             << " start_us " << timeAsUs(_start_time)
+             << " finish_us " << timeAsUs(eventlist().now())
+             << " fct_us " << timeAsUs(fct)
+             << " size_bytes " << (_flow_size - mss())
+             << endl;
+        if (_end_trigger) {
+            _end_trigger->activate();
+        }
     }
 }
 
@@ -906,6 +958,16 @@ SwiftSubflowSink::receivePacket(Packet& pkt) {
     int size = p->size(); // TODO: the following code assumes all packets are the same size
     pkt.flow().logTraffic(pkt,*this,TrafficLogger::PKT_RCVDESTROY);
 
+    // Handle trimmed (header-only) packets: payload was stripped at a switch.
+    // Send a flagged ACK immediately so the sender can apply instant MD and
+    // retransmit without waiting for 3 dup-ACKs or RTO.
+    if (pkt.header_only()) {
+        _drops++;
+        p->free();
+        send_ack(ts, true);  // trimmed=true: tells sender to apply MD immediately
+        return;
+    }
+
     _packets+= p->size();
 
     if (seqno == _cumulative_ack+1) { // it's the next expected seq no
@@ -947,14 +1009,15 @@ SwiftSubflowSink::receivePacket(Packet& pkt) {
 
     // whatever the cumulative ack does (eg filling holes), the echoed TS is always from
     // the packet we just received
-    send_ack(ts);
+    send_ack(ts, false);
 }
 
 void 
-SwiftSubflowSink::send_ack(simtime_picosec ts) {
+SwiftSubflowSink::send_ack(simtime_picosec ts, bool trimmed) {
     const Route* rt = _route;
     
     SwiftAck *ack = SwiftAck::newpkt(_subflow_src->flow(), *rt, 0, _cumulative_ack, _sink._cumulative_data_ack, ts);
+    ack->set_trimmed(trimmed);
 
     ack->flow().logTraffic(*ack,*this,TrafficLogger::PKT_CREATESEND);
     ack->sendOn();

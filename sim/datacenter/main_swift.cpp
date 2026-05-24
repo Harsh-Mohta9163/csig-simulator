@@ -38,7 +38,7 @@
 
 uint32_t RTT = 1; // this is per link delay in us; identical RTT microseconds = 0.001 ms
 #define DEFAULT_NODES 128
-#define DEFAULT_QUEUE_SIZE 8
+#define DEFAULT_QUEUE_SIZE 500   // packets; needs ~500 at 800Gbps for Swift to avoid drops
 
 //FirstFit* ff = NULL;
 //uint32_t subflow_count = 1;
@@ -64,10 +64,11 @@ int main(int argc, char **argv) {
     stringstream filename(ios_base::out);
     uint32_t packet_size = 4000;
     bool plb = false;
+    bool trimming = false;
     uint32_t no_of_subflows = 1;
     simtime_picosec tput_sample_time = timeFromUs((uint32_t)12);
     simtime_picosec endtime = timeFromMs(1.2);
-    char* tm_file = NULL;
+        char* tm_file = NULL;
     char* topo_file = NULL;
 
     int i = 1;
@@ -126,6 +127,15 @@ int main(int argc, char **argv) {
                 exit_error(argv[0]);
             }
             i++;            
+        } else if (!strcmp(argv[i],"-trimming")){
+            if (strcmp(argv[i+1], "off") == 0) {
+                trimming = false;
+            } else if (strcmp(argv[i+1], "on") == 0) {
+                trimming = true;
+            } else {
+                exit_error(argv[0]);
+            }
+            i++;            
         } else {
             exit_error(argv[i]);
         }
@@ -145,6 +155,7 @@ int main(int argc, char **argv) {
     cout << "mtu " << packet_size << endl;
     cout << "plb " << plb << endl;
     cout << "subflows " << no_of_subflows << endl;
+    cout << "trimming " << trimming << endl;
       
     // prepare the loggers
 
@@ -178,12 +189,14 @@ int main(int argc, char **argv) {
     SwiftRtxTimerScanner swiftRtxScanner(timeFromMs(10), eventlist);
    
 #ifdef FAT_TREE
-    /*
-    FatTreeTopology* top = new FatTreeTopology(no_of_nodes, linkspeed, queuesize, 
-                                               &logfile, &eventlist, NULL, RANDOM, SWIFT_SCHEDULER, 0);
-    */
-    FatTreeTopology* top = new FatTreeTopology(no_of_nodes, linkspeed, queuesize, 
-                                               NULL, &eventlist, NULL, RANDOM, SWIFT_SCHEDULER, 0);
+    FatTreeTopology* top;
+    if (topo_file) {
+        // Load topology parameters (speed, latency, oversubscription) from file
+        top = FatTreeTopology::load(topo_file, NULL, eventlist, queuesize, trimming ? COMPOSITE : RANDOM, SWIFT_SCHEDULER);
+    } else {
+        top = new FatTreeTopology(no_of_nodes, linkspeed, queuesize, 
+                                  NULL, &eventlist, NULL, trimming ? COMPOSITE : RANDOM, SWIFT_SCHEDULER, 0);
+    }
 #endif
 
 #ifdef OV_FAT_TREE
@@ -256,6 +269,8 @@ is_dest[i] = 0;
     list <SwiftSrc*> swift_srcs;
     // initialize all sources/sinks
 
+    map<flowid_t, TriggerTarget*> flowmap;
+
     uint32_t connID = 0;
     all_conns = conns->getAllConnections();
 
@@ -282,9 +297,24 @@ is_dest[i] = 0;
 
         if (flowsize){
             swiftSrc->set_flowsize(flowsize*Packet::data_packet_size());
+        } else if (crt->size > 0) {
+            // use per-connection size from the traffic matrix file (already in bytes)
+            swiftSrc->set_flowsize(crt->size);
         }
                 
         swift_srcs.push_back(swiftSrc);
+        if (crt->flowid) {
+            assert(flowmap.find(crt->flowid) == flowmap.end());
+            flowmap[crt->flowid] = swiftSrc;
+        }
+        if (crt->trigger) {
+            Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
+            trig->add_target(*swiftSrc);
+        }
+        if (crt->send_done_trigger) {
+            Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
+            swiftSrc->set_end_trigger(*trig);
+        }
         if (plb) {
             swiftSrc->enable_plb();
         }
@@ -371,14 +401,15 @@ is_dest[i] = 0;
         routein = new Route(*top->get_paths(dest,src)->at(choice));
         //routein->push_back(swiftSrc);
 
+        simtime_picosec starttime = crt->trigger ? TRIGGER_START : timeFromUs((uint32_t)crt->start);
         if (no_of_subflows == 1) {
-            swiftSrc->connect(*routeout, *routein, *swiftSnk, timeFromUs((uint32_t)crt->start));
+            swiftSrc->connect(*routeout, *routein, *swiftSnk, starttime);
         }
         swiftSrc->set_paths(net_paths[src][dest]);
         if (no_of_subflows > 1) {
             // could probably use this for single-path case too, but historic reasons
             cout << "will start subflow " << c << " at " << crt->start << endl;
-            swiftSrc->multipath_connect(*swiftSnk, timeFromUs((uint32_t)crt->start), no_of_subflows);
+            swiftSrc->multipath_connect(*swiftSnk, starttime, no_of_subflows);
         }
           
         sinkLogger.monitorSink(swiftSnk);

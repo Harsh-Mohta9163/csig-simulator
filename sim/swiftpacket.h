@@ -64,6 +64,7 @@ public:
         p->_ackno = ackno;
         p->_ds_ackno = ds_ackno;
         p->_ts_echo = ts_echo;
+        p->_is_trimmed = false;
         return p;
     }
 
@@ -72,6 +73,8 @@ public:
     inline seq_t ackno() const {return _ackno;}
     inline seq_t ds_ackno() const {return _ds_ackno;}
     inline simtime_picosec ts_echo() const {return _ts_echo;}
+    inline bool is_trimmed() const {return _is_trimmed;}
+    inline void set_trimmed(bool t) {_is_trimmed = t;}
     virtual PktPriority priority() const {return Packet::PRIO_HI;}
 
     virtual ~SwiftAck(){}
@@ -81,6 +84,7 @@ protected:
     seq_t _ackno;
     seq_t _ds_ackno;
     simtime_picosec _ts_echo;
+    bool _is_trimmed;
     static PacketDB<SwiftAck> _packetdb;
 };
 

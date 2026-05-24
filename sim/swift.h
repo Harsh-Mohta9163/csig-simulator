@@ -2,6 +2,8 @@
 #ifndef SWIFT_H
 #define SWIFT_H
 
+#include "trigger.h"
+
 /*
  * A Swift source and sink, loosely based off of Tcp
  */
@@ -52,7 +54,7 @@ public:
     void update_rtt(simtime_picosec delay);
     void adjust_cwnd(simtime_picosec delay, SwiftAck::seq_t ackno);
     void applySwiftLimits();
-    void handle_ack(SwiftAck::seq_t ackno);
+    void handle_ack(SwiftAck::seq_t ackno, bool packet_was_trimmed = false);
     void move_path();
     void reroute(const Route &route);
     void doNextEvent();
@@ -119,7 +121,7 @@ private:
     string _nodename;
 };
 
-class SwiftSrc : public EventSource {
+class SwiftSrc : public EventSource, public TriggerTarget {
     friend class SwiftSink;
     friend class SwiftRtxTimerScanner;
     //friend class SwiftSubflowSrc;
@@ -130,6 +132,8 @@ public:
                          SwiftSink& sink, simtime_picosec startTime);
     virtual void multipath_connect(SwiftSink& sink, simtime_picosec startTime, uint32_t no_of_subflows);
     void startflow();
+    virtual void activate();  // TriggerTarget: called to start flow from a trigger
+    void set_end_trigger(Trigger& trigger);
 
     void doNextEvent();
     void update_dsn_ack(SwiftAck::seq_t ds_ackno);
@@ -205,6 +209,10 @@ public:
     SwiftSink* _sink;
     void set_app_limit(int pktps);
 
+    // Per-flow FCT tracking
+    simtime_picosec _start_time;  // when the flow was scheduled to start
+    bool _flow_finished;          // true once FCT has been printed
+    Trigger* _end_trigger;        // fired when last byte is ACKed
 
     // Swift helper functions
     simtime_picosec targetDelay(uint32_t cwnd, const Route& route);
@@ -254,7 +262,7 @@ private:
     const Route* _route;
 
     // Mechanism
-    void send_ack(simtime_picosec ts);
+    void send_ack(simtime_picosec ts, bool trimmed = false);
 
     SwiftSubflowSrc* _subflow_src;
     SwiftSink& _sink;
