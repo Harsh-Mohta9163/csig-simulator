@@ -1,0 +1,36 @@
+# 128-node 8:1 oversubscribed 3-tier fat tree
+# Paper setup: 800Gbps, 400ns switch latency, 600ns link latency
+# 2 pods x 64 hosts/pod = 128 nodes
+# ToR: 8 down (hosts) + 1 up = 8:1 OS. AGG: 8 down + 8 up. Core: 2 down.
+# no_of_tor_uplinks = 128*800/(800*8) = 16
+# agg_switches_per_pod = radix_up[TOR]/bundlesize[AGG] = 1/1 = 1
+# no_of_agg_uplinks = 16*800/(800*1) = 16
+# no_of_core_switches = 16/2 = 8
+# AGG up-radix check: (8*1)/1 = 8 = radix_up[AGG] OK
+Nodes 128
+Tiers 3
+Podsize 64
+
+Tier 0
+Oversubscribed 8
+Downlink_speed_Gbps 800
+Radix_Down 8
+Radix_Up 1
+Downlink_Latency_ns 600
+Switch_Latency_ns 400
+
+Tier 1
+Oversubscribed 1
+Downlink_speed_Gbps 800
+Radix_Down 8
+Radix_Up 8
+Downlink_Latency_ns 600
+Switch_Latency_ns 400
+Bundle 1
+
+Tier 2
+Downlink_speed_Gbps 800
+Radix_Down 2
+Downlink_Latency_ns 600
+Switch_Latency_ns 400
+Bundle 1

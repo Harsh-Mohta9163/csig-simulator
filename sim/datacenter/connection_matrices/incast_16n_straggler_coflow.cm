@@ -1,0 +1,17 @@
+Nodes 16
+Connections 15
+1->0 id 1 start 0 size 1048576 recv_done_trigger 1
+2->0 id 2 start 0 size 1048576 recv_done_trigger 1
+3->0 id 3 start 0 size 1048576 recv_done_trigger 1
+4->0 id 4 start 0 size 1048576 recv_done_trigger 1
+5->0 id 5 start 0 size 1048576 recv_done_trigger 1
+6->0 id 6 start 0 size 1048576 recv_done_trigger 1
+7->0 id 7 start 0 size 1048576 recv_done_trigger 1
+8->0 id 8 start 0 size 1048576 recv_done_trigger 1
+9->0 id 9 start 0 size 1048576 recv_done_trigger 1
+10->0 id 10 start 0 size 1048576 recv_done_trigger 1
+11->0 id 11 start 0 size 1048576 recv_done_trigger 1
+12->0 id 12 start 0 size 1048576 recv_done_trigger 1
+13->0 id 13 start 0 size 1048576 recv_done_trigger 1
+14->0 id 14 start 0 size 1048576 recv_done_trigger 1
+15->0 id 15 start 0 size 524288 recv_done_trigger 1

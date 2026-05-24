@@ -1,0 +1,34 @@
+Nodes 1024
+Connections 32
+354->0 id 1 start 0 size 32768
+283->0 id 2 start 0 size 32768
+343->0 id 3 start 0 size 32768
+1019->0 id 4 start 0 size 32768
+212->0 id 5 start 0 size 32768
+443->0 id 6 start 0 size 32768
+248->0 id 7 start 0 size 32768
+452->0 id 8 start 0 size 32768
+865->0 id 9 start 0 size 32768
+426->0 id 10 start 0 size 32768
+19->0 id 11 start 0 size 32768
+211->0 id 12 start 0 size 32768
+263->0 id 13 start 0 size 32768
+896->0 id 14 start 0 size 32768
+139->0 id 15 start 0 size 32768
+196->0 id 16 start 0 size 32768
+150->0 id 17 start 0 size 32768
+898->0 id 18 start 0 size 32768
+793->0 id 19 start 0 size 32768
+667->0 id 20 start 0 size 32768
+963->0 id 21 start 0 size 32768
+949->0 id 22 start 0 size 32768
+869->0 id 23 start 0 size 32768
+50->0 id 24 start 0 size 32768
+302->0 id 25 start 0 size 32768
+510->0 id 26 start 0 size 32768
+478->0 id 27 start 0 size 32768
+813->0 id 28 start 0 size 32768
+54->0 id 29 start 0 size 32768
+151->0 id 30 start 0 size 32768
+230->0 id 31 start 0 size 32768
+175->0 id 32 start 0 size 32768

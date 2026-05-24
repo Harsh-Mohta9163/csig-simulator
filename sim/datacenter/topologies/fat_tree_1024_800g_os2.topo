@@ -1,0 +1,30 @@
+# 1024-node 2:1 oversubscribed 3-tier fat tree
+# Paper setup: 800Gbps, 400ns switch latency, 600ns link latency
+# k=16 with 2:1 OS at ToR: 8 down (hosts) + 4 up
+Nodes 1024
+Tiers 3
+Podsize 64
+
+Tier 0
+Oversubscribed 2
+Downlink_speed_Gbps 800
+Radix_Down 8
+Radix_Up 4
+Downlink_Latency_ns 600
+Switch_Latency_ns 400
+
+Tier 1
+Oversubscribed 1
+Downlink_speed_Gbps 800
+Radix_Down 8
+Radix_Up 8
+Downlink_Latency_ns 600
+Switch_Latency_ns 400
+Bundle 1
+
+Tier 2
+Downlink_speed_Gbps 800
+Radix_Down 16
+Downlink_Latency_ns 600
+Switch_Latency_ns 400
+Bundle 1

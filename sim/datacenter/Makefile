@@ -7,7 +7,7 @@ INCLUDE= -I/$(CRT)/.. -I$(CRT)
 LIB=-L..
 DEPS=../libhtsim.a
 
-all:	htsim_tcp htsim_ndp htsim_roce htsim_swift htsim_hpcc htsim_eqds
+all:	htsim_tcp htsim_ndp htsim_roce htsim_swift htsim_hpcc htsim_eqds htsim_fastflow
 
 
 htsim_tcp: main_tcp.o firstfit.o ../libhtsim.a vl2_topology.o fat_tree_topology.o fat_tree_switch.o dragon_fly_topology.o bcube_topology.o connection_matrix.o oversubscribed_fat_tree_topology.o shortflows.o multihomed_fat_tree_topology.o star_topology.o
@@ -30,6 +30,13 @@ htsim_hpcc: main_hpcc.o firstfit.o ../libhtsim.a vl2_topology.o fat_tree_topolog
 
 htsim_swift: main_swift.o firstfit.o ../libhtsim.a vl2_topology.o fat_tree_topology.o fat_tree_switch.o bcube_topology.o connection_matrix.o oversubscribed_fat_tree_topology.o shortflows.o multihomed_fat_tree_topology.o star_topology.o generic_topology.o
 	$(CC) $(CFLAGS) firstfit.o main_swift.o vl2_topology.o fat_tree_topology.o fat_tree_switch.o bcube_topology.o connection_matrix.o oversubscribed_fat_tree_topology.o shortflows.o star_topology.o multihomed_fat_tree_topology.o generic_topology.o $(LIB) -lhtsim -o htsim_swift
+
+
+htsim_fastflow: main_fastflow.o firstfit.o ../libhtsim.a vl2_topology.o fat_tree_topology.o fat_tree_switch.o bcube_topology.o connection_matrix.o oversubscribed_fat_tree_topology.o shortflows.o multihomed_fat_tree_topology.o star_topology.o generic_topology.o
+	$(CC) $(CFLAGS) firstfit.o main_fastflow.o vl2_topology.o fat_tree_topology.o fat_tree_switch.o bcube_topology.o connection_matrix.o oversubscribed_fat_tree_topology.o shortflows.o star_topology.o multihomed_fat_tree_topology.o generic_topology.o $(LIB) -lhtsim -o htsim_fastflow
+
+main_fastflow.o: main_fastflow.cpp ${DEPS}
+	$(CC) $(INCLUDE) $(CFLAGS) -c main_fastflow.cpp
 
 
 main_tcp.o: main_tcp.cpp ${DEPS}
