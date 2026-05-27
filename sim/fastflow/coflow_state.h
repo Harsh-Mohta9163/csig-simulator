@@ -34,6 +34,8 @@ typedef uint32_t SenderId;
 struct CoflowEntry {
     uint64_t max_progress;
     std::unordered_map<SenderId, uint64_t> bytes_by_sender;
+    std::unordered_map<SenderId, bool> finished;      // true once ALL flows done
+    std::unordered_map<SenderId, uint32_t> flow_count; // flows registered per sender
     uint32_t num_senders;
     CoflowEntry() : max_progress(0), num_senders(0) {}
 };
@@ -70,6 +72,9 @@ public:
     uint32_t credit_for(CoflowId cid, SenderId sid,
                         uint32_t fair_quantum,
                         uint32_t priority_quantum) const;
+
+    // Mark a sender as done so it doesn't count as a straggler.
+    void mark_finished(CoflowId cid, SenderId sid);
 
     bool has_coflow(CoflowId cid) const {
         return _coflows.find(cid) != _coflows.end();

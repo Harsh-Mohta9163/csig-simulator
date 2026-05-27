@@ -83,6 +83,7 @@ public:
     void set_flowsize(uint64_t bytes);
     uint64_t flowsize() const { return _flow_size; }
     void set_paths(vector<const Route*>* rt);
+    void enable_plb() { _plb = true; }
 
     // ====================== Global tunables (paper Sec 3.5) ================
     static uint16_t _mtu;          // MTU in bytes (data packet payload)
@@ -127,6 +128,9 @@ protected:
     PacketFlow _flow;
     vector<const Route*> _paths;  // ECMP path pool
     uint32_t _path_index;
+    bool _plb;                          // PLB enabled
+    simtime_picosec _plb_last_good;     // timestamp of last congestion-free ACK
+    simtime_picosec _plb_interval;      // retry-path interval (randomised)
 
     // --- Sending state ---
     uint64_t _highest_sent;       // highest seqno ever sent (bytes)

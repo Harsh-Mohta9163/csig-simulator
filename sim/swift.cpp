@@ -520,8 +520,8 @@ SwiftSubflowSrc::rtx_timer_hook(simtime_picosec now, simtime_picosec period) {
         //reset our rtx timerRFC 2988 5.5 & 5.6
 
         _rto *= 2;
-        //if (_rto > timeFromMs(1000))
-        //  _rto = timeFromMs(1000);
+        if (_rto > timeFromMs(100))
+            _rto = timeFromMs(100);  // cap at 100ms to prevent indefinite stalls
         _RFC2988_RTO_timeout = now + _rto;
     }
 }
@@ -633,7 +633,7 @@ SwiftSrc::SwiftSrc(SwiftRtxTimerScanner& rtx_scanner, SwiftLogger* logger, Traff
     _base_delay = timeFromUs((uint32_t)20);    // configured base target delay.  To be confirmed by experiment - reproduce fig 17
     _h = _base_delay/6.55;            // path length scaling constant.  Value is a guess, will be clarified by experiment
     _rtx_reset_threshold = 5; // value is a guess
-    _min_cwnd = 10;  // guess - if we go less than 10 bytes, we probably get into rounding 
+    _min_cwnd = _mss;  // always allow at least 1 packet; avoids enormous pacing delays
     _max_cwnd = 1000 * _mss;  // maximum cwnd we can use.  Guess - how high should we allow cwnd to go?  Presumably something like B*target_delay?
 
     // PLB init
@@ -875,29 +875,48 @@ void SwiftSrc::doNextEvent() {
 SwiftPacer::SwiftPacer(SwiftSubflowSrc& sub, EventList& event_list)
     : EventSource(event_list,"swift_pacer"), _sub(&sub), _interpacket_delay(0) {
     _last_send = eventlist().now();
+    _next_send = 0;
+    _pending_event_time = 0;
 }
 
 void
 SwiftPacer::schedule_send(simtime_picosec delay) {
     _interpacket_delay = delay;
-    _next_send = _last_send + _interpacket_delay;
-    if (_next_send <= eventlist().now()) {
-        // Tricky!  We're going in to pacing mode, but it's more than
-        // the pacing delay since we last sent.  Presumably the best
-        // thing is to immediately send, and then pacing will kick in
-        // next time round.
+    simtime_picosec new_next = _last_send + _interpacket_delay;
+
+    if (new_next <= eventlist().now()) {
+        // Need to send immediately; cancel any stale pending event first.
+        if (_pending_event_time > 0) {
+            eventlist().cancelPendingSourceByTime(*this, _pending_event_time);
+            _pending_event_time = 0;
+        }
         _next_send = eventlist().now();
         doNextEvent();
         return;
     }
-    eventlist().sourceIsPending(*this, _next_send);
+
+    if (_pending_event_time > 0 && _pending_event_time != new_next) {
+        // Pacing delay changed — cancel the old event and reschedule.
+        eventlist().cancelPendingSourceByTime(*this, _pending_event_time);
+        _pending_event_time = 0;
+    }
+
+    _next_send = new_next;
+    if (_pending_event_time == 0) {
+        _pending_event_time = _next_send;
+        eventlist().sourceIsPending(*this, _next_send);
+    }
+    // else: already pending at the same time; no-op.
 }
 
 void
 SwiftPacer::cancel() {
     _interpacket_delay = 0;
+    if (_pending_event_time > 0) {
+        eventlist().cancelPendingSourceByTime(*this, _pending_event_time);
+        _pending_event_time = 0;
+    }
     _next_send = 0;
-    eventlist().cancelPendingSource(*this);
 }
 
 // called when we're in window-mode to update the send time so it's always correct if we
@@ -910,6 +929,7 @@ SwiftPacer::just_sent() {
 void
 SwiftPacer::doNextEvent() {
     assert(eventlist().now() == _next_send);
+    _pending_event_time = 0;
     _sub->send_next_packet();
     _last_send = eventlist().now();
     //cout << "sending paced packet" << endl;

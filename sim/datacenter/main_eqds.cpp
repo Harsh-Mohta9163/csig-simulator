@@ -311,6 +311,8 @@ int main(int argc, char **argv) {
                 FatTreeSwitch::set_strategy(FatTreeSwitch::RR);
             }
             i++;
+        } else if (!strcmp(argv[i],"-fct_log")) {
+            EqdsSrc::_emit_fct = true;
         } else {
             cout << "Unknown parameter " << argv[i] << endl;
             exit_error(argv[0]);

@@ -8,7 +8,9 @@ CoflowRegistry::register_sender(CoflowId cid, SenderId sid) {
     if (e.bytes_by_sender.find(sid) == e.bytes_by_sender.end()) {
         e.bytes_by_sender[sid] = 0;
         e.num_senders++;
+        e.flow_count[sid] = 0;
     }
+    e.flow_count[sid]++;
 }
 
 void
@@ -18,6 +20,21 @@ CoflowRegistry::update_progress(CoflowId cid, SenderId sid, uint32_t bytes) {
     uint64_t& s = e.bytes_by_sender[sid];
     s += bytes;
     if (s > e.max_progress) e.max_progress = s;
+}
+
+void
+CoflowRegistry::mark_finished(CoflowId cid, SenderId sid) {
+    if (cid == NO_COFLOW) return;
+    auto it = _coflows.find(cid);
+    if (it == _coflows.end()) return;
+    CoflowEntry& e = it->second;
+    auto fc = e.flow_count.find(sid);
+    if (fc == e.flow_count.end()) return;
+    if (fc->second > 0) fc->second--;
+    // Only mark as fully finished when all flows from this sender are done.
+    if (fc->second == 0) {
+        e.finished[sid] = true;
+    }
 }
 
 uint32_t
@@ -32,25 +49,27 @@ CoflowRegistry::credit_for(CoflowId cid, SenderId sid,
     const CoflowEntry& e = it->second;
     auto sit = e.bytes_by_sender.find(sid);
     if (sit == e.bytes_by_sender.end()) return fair_quantum;
+
+    // Skip if this sender is already done — no credits needed.
+    auto fit = e.finished.find(sid);
+    if (fit != e.finished.end() && fit->second) return fair_quantum;
+
     uint64_t my = sit->second;
 
-    // Does *any* sender lag by > gap_threshold ?
-    bool has_straggler = false;
+    // Compute max_progress among ACTIVE (not-finished) senders only.
+    uint64_t active_max = 0;
     for (const auto& kv : e.bytes_by_sender) {
-        if (e.max_progress - kv.second > _gap_threshold) {
-            has_straggler = true;
-            break;
-        }
+        auto fi = e.finished.find(kv.first);
+        if (fi != e.finished.end() && fi->second) continue;  // skip finished
+        if (kv.second > active_max) active_max = kv.second;
     }
 
-    if (my == e.max_progress && has_straggler && e.num_senders > 1) {
-        // Leader: starve until stragglers catch up.
-        return 0;
-    }
-    if (e.max_progress - my > _gap_threshold) {
-        // Straggler: flood with priority credits.
+    if (active_max - my > _gap_threshold) {
+        // Straggler: flood with priority credits to help it catch up.
         return priority_quantum;
     }
-    // Middle of the pack: fair share.
+    // Leader or middle of the pack: fair share.
+    // (We do NOT starve leaders — in a credit-gated fabric, starvation causes
+    // deadlocks and only the straggler boost matters for coflow completion time.)
     return fair_quantum;
 }

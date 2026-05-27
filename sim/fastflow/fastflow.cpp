@@ -48,6 +48,9 @@ FastflowSrc::FastflowSrc(FastflowRtxTimerScanner& rtx_scanner,
     _route         = NULL;
     _sink          = NULL;
     _path_index    = 0;
+    _plb           = false;
+    _plb_last_good = 0;
+    _plb_interval  = timeFromSec(1);
 
     _highest_sent  = 0;
     _last_acked    = 0;
@@ -236,6 +239,23 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
     // RTT sample (timestamp echo)
     simtime_picosec rtt_sample = now - ack.ts_echo();
     update_rtt(rtt_sample);
+
+    // PLB: switch ECMP path on persistent congestion (paper: multi-pathing for all)
+    bool ecn_for_plb = ack.ecn_echo();
+    if (_plb && !_paths.empty() && _rtt > 0) {
+        if (rtt_sample <= _target_rtt && !ecn_for_plb) {
+            _plb_last_good = now;
+            _plb_interval = (simtime_picosec)(random() % (2 * _rtt)) + 5 * _rtt;
+        }
+        if (now - _plb_last_good > _plb_interval) {
+            _plb_last_good = now;
+            uint32_t new_idx = (uint32_t)(random() % _paths.size());
+            _path_index = new_idx;
+            Route* new_route = _paths[_path_index]->clone();
+            new_route->push_back(_sink);
+            _route = new_route;
+        }
+    }
 
     // Post-QuickAdapt ignore window: we already shrank cwnd, so suppress
     // *further decreases* until the in-flight stale signals drain. We
@@ -615,10 +635,13 @@ FastflowSrc::receivePacket(Packet& pkt) {
     if (pull) {
         _receiver_credits += pull->credit_bytes();
         pull->free();
-        // Do NOT call send_packets() here — the ACK for the same delivered
-        // packet already triggered send_packets(). A second call would use
-        // the cwnd headroom that the ACK just opened and create an extra
-        // burst on top of the ACK-driven burst, worsening incast congestion.
+        // If the credit brought us above the send threshold, kick the sender.
+        // This is needed when coflow throttled credits to 0 (no ACK-driven
+        // send_packets fired with credits available), causing a deadlock where
+        // the flow waits for credits it will never receive until it sends.
+        if (_receiver_credits >= _mtu) {
+            send_packets();
+        }
         return;
     }
     FastflowAck* ack = dynamic_cast<FastflowAck*>(&pkt);
@@ -656,6 +679,9 @@ FastflowSrc::maybe_report_completion() {
     if (_last_acked < _flow_size) return;
     _flow_finished = true;
     _rtx_scanner->deregisterSrc(*this);
+    if (_sink && _sink->_coflow_id != NO_COFLOW) {
+        CoflowRegistry::instance().mark_finished(_sink->_coflow_id, _sink->_sender_id);
+    }
     simtime_picosec fct = eventlist().now() - _start_time;
     // Same line format as Swift so plot_swift_results.py parses it natively.
     cout << "FCT " << _name

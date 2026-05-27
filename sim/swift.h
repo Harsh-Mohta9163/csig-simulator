@@ -40,6 +40,7 @@ private:
     simtime_picosec _interpacket_delay; // the interpacket delay, or zero if we're not pacing
     simtime_picosec _last_send;  // when the last packet was sent (always set, even when we're not pacing)
     simtime_picosec _next_send;  // when the next scheduled packet should be sent
+    simtime_picosec _pending_event_time; // time we passed to sourceIsPending; 0 if no event queued
 };
 
 // stuff that is specific to a subflow rather than the whole connection

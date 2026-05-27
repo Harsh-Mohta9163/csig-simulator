@@ -122,6 +122,8 @@ class EqdsSrc : public EventSource, public PacketSink, public TriggerTarget {
     static bool _debug;
     bool _debug_src;
     bool debug() const {return _debug_src;}
+    static bool _emit_fct;       // when true, print FCT <name> ... lines on flow finish
+    simtime_picosec _flow_start; // set in startFlow() for FCT calculation
    
  private:
     EqdsNIC& _nic;

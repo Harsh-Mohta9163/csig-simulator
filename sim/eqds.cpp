@@ -26,7 +26,8 @@ uint16_t EqdsSrc::_hdr_size = 64;
 uint16_t EqdsSrc::_mss = 4096;
 uint16_t EqdsSrc::_mtu = _mss + _hdr_size;
 
-bool EqdsSrc::_debug = false; 
+bool EqdsSrc::_debug = false;
+bool EqdsSrc::_emit_fct = false; 
 
 // uncomment below - commented out for testing
 //#define USE_CWND  
@@ -465,7 +466,15 @@ bool EqdsSrc::checkFinished(EqdsDataPacket::seq_t cum_ack) {
         cout << _nodename << " checkFinished " << " cum_acc " << cum_ack << " mss " << _mss << " RTS sent " << _rts_packets_sent << " total bytes " << (cum_ack - _rts_packets_sent) * _mss << " flow_size " << _flow_size << " done_sending " << _done_sending << endl;
 
     if ((((mem_b)cum_ack -_rts_packets_sent) * _mss) >= _flow_size) {
-        cout << "Flow " << _name << " flowId " << flowId() << " " << _nodename << " finished at " << timeAsUs(eventlist().now()) << " total packets " << cum_ack << " RTS " << _rts_packets_sent << " total bytes " << ((mem_b)cum_ack - _rts_packets_sent) * _mss << endl;
+        if (_emit_fct) {
+            double start_us = timeAsUs(_flow_start);
+            double finish_us = timeAsUs(eventlist().now());
+            cout << "FCT " << _name << " start_us " << start_us
+                 << " finish_us " << finish_us << " fct_us " << (finish_us - start_us)
+                 << " size_bytes " << _flow_size << "\n";
+        } else {
+            cout << "Flow " << _name << " flowId " << flowId() << " " << _nodename << " finished at " << timeAsUs(eventlist().now()) << " total packets " << cum_ack << " RTS " << _rts_packets_sent << " total bytes " << ((mem_b)cum_ack - _rts_packets_sent) * _mss << endl;
+        }
         _state = IDLE;
         if (_end_trigger) {
             _end_trigger->activate();
@@ -605,6 +614,7 @@ void EqdsSrc::setFlowsize(uint64_t flow_size_in_bytes) {
 }
 
 void EqdsSrc::startFlow() {
+    _flow_start = eventlist().now();
     _cwnd = _maxwnd;
     _credit_spec = _maxwnd;
     if (_debug_src) cout << "startflow " <<  _flow._name <<  " CWND " << _cwnd << " at " << timeAsUs(eventlist().now()) << " flow " << _flow.str() << endl;

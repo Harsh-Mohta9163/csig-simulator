@@ -99,14 +99,24 @@ def normalized_throughput_incast(rows, degree, size_bytes):
     return total_norm / degree
 
 
+_PROTO_TO_DIR = {
+    "swift":                    "swift",                    # in results/swift/
+    "fastflow":                 "fastflow/fastflow",
+    "fastflow+eqds":            "fastflow/fastflow_eqds",
+    "fastflow+eqds+mcc":        "fastflow/fastflow_eqds_mcc",
+    "fastflow+ra_qa":           "fastflow/fastflow+ra_qa",
+    "fastflow+eqds+mcc+ra_qa":  "fastflow/fastflow_eqds_mcc+ra_qa",
+}
+
+
 def _results_dir_for_proto(results_root, proto):
     """Map protocol string → directory containing .fct files."""
+    subdir = _PROTO_TO_DIR.get(proto)
+    if subdir is None:
+        raise ValueError(f"Unknown protocol: {proto!r}. Add it to _PROTO_TO_DIR.")
     if proto == "swift":
         return results_root / "swift"
-    # FASTFLOW tags: + → _, e.g. fastflow+eqds+mcc → fastflow_eqds_mcc
-    # But ra_qa suffix is already added as +ra_qa in tag names
-    tag = proto.replace("+", "_")
-    return results_root / "fastflow" / tag
+    return results_root / subdir
 
 
 def load_incast(results_root, proto, degree, sizekib):

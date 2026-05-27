@@ -48,7 +48,7 @@ static void exit_error(const char* progname) {
     cout << "Usage: " << progname
          << " [-tm tm-file] [-topo topo-file] [-nodes N] [-q Q] [-mtu MTU]"
          << " [-linkspeed Mbps] [-end us]"
-         << " [-trimming on|off] [-ra_qa on|off]"
+         << " [-trimming on|off] [-plb on|off] [-ra_qa on|off]"
          << " [-mode fastflow|fastflow+eqds|fastflow+eqds+mcc|fastflow+eqds+mcc+coflow]"
          << " [-msg_target_bw Bps] [-msg_tolerance 0..1]"
          << " [-coflow_gap bytes]"
@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
 
     bool trimming = true;
     bool ra_qa = false;
+    bool plb = true;  // paper: multi-pathing enabled for all algorithms
     bool use_credits = false;
     bool use_mcc = false;
     bool use_coflow = false;
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-linkspeed")) { linkspeed = speedFromMbps(atof(argv[++i])); }
         else if (!strcmp(argv[i], "-end"))     { endtime = timeFromUs(atof(argv[++i])); }
         else if (!strcmp(argv[i], "-trimming")) { trimming = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-plb"))     { plb = flag_on(argv[++i]); }
         else if (!strcmp(argv[i], "-ra_qa"))   { ra_qa = flag_on(argv[++i]); }
         else if (!strcmp(argv[i], "-mode")) {
             const char* m = argv[++i];
@@ -144,6 +146,7 @@ int main(int argc, char** argv) {
                                     : "fastflow+eqds")
                          : "fastflow")
          << " trimming=" << trimming
+         << " plb="      << plb
          << " ra_qa="    << ra_qa
          << " mtu="      << packet_size
          << " nodes="    << no_of_nodes
@@ -250,6 +253,10 @@ int main(int argc, char** argv) {
 
         FastflowSrc*  src  = new FastflowSrc(rtx_scanner, NULL, eventlist);
         FastflowSink* sink = new FastflowSink();
+
+        // Give the src all ECMP paths so PLB can switch between them at runtime.
+        src->set_paths(net_paths[s][d]);
+        if (plb) src->enable_plb();
 
         src->setName ("fastflow_"      + ntoa(s) + "_" + ntoa(d));
         sink->setName("fastflow_sink_" + ntoa(s) + "_" + ntoa(d));
