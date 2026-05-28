@@ -33,6 +33,7 @@ bool     FastflowSrc::_enable_ra_qa   = false;
 bool     FastflowSrc::_enable_credits = false;
 bool     FastflowSrc::_enable_mcc     = false;
 bool     FastflowSrc::_trim_supported = true;
+bool     FastflowSrc::_blast_start    = false;
 
 // ===========================================================================
 //                        FastflowSrc — constructor
@@ -84,11 +85,13 @@ FastflowSrc::FastflowSrc(FastflowRtxTimerScanner& rtx_scanner,
     _retransmits_dbg = 0;
     _blocked_rtx_dbg = 0;
 
-    // Initial burst = 1 BDP. The credit check is secondary to cwnd; the burst
-    // ensures credits never restrict sending *more* than cwnd in the first
-    // BDP worth of bytes. After the burst is consumed, per-packet receiver
-    // credits replenish at exactly the delivery rate, so no starvation occurs.
-    _initial_burst_remaining = _enable_credits ? _bdp_bytes : ((uint64_t)1 << 62);
+    // Initial burst = 1 MTU when credits are enabled. This bootstraps the
+    // credit loop: the first packet arrives at the receiver, which issues a
+    // BDP-sized credit grant back to the sender. The grant fills the pipeline
+    // and subsequent 1:1 packet/credit maintains it.
+    // 1 MTU startup prevents incast burst storms (100 senders × 1 pkt is fine).
+    // When credits are disabled, allow unlimited sending (cwnd is the only gate).
+    _initial_burst_remaining = _enable_credits ? (uint64_t)_mtu : ((uint64_t)1 << 62);
     _receiver_credits = 0;
     _msg_start_time = 0;
     _msg_acked      = 0;
@@ -186,6 +189,15 @@ FastflowSrc::startflow() {
     }
     _msg_start_time = eventlist().now();
     _msg_acked = 0;
+    // Blast-start is opt-in via -blast_start flag only. Unconditionally opening
+    // cwnd to BDP catastrophically degrades vanilla FASTFLOW: 100 senders × BDP
+    // in incast = trim storm (30× slowdown); 1024 senders × BDP in permutation
+    // overwhelms the 8:1 oversubscribed core, ~10% of flows fail to complete.
+    // 1 MTU start with strict FastIncrease gating ramps to BDP in ~10 RTTs
+    // without burst storms.
+    if (_blast_start) {
+        _cwnd = _bdp_bytes;
+    }
     send_packets();
 }
 
@@ -354,11 +366,25 @@ FastflowSrc::quick_adapt(FastflowAck& ack, simtime_picosec now) {
 
 bool
 FastflowSrc::fast_increase(FastflowAck& ack) {
-    // Algorithm 3
+    // Algorithm 3.
+    // The gate strictness depends on the mode:
+    //   - Vanilla FASTFLOW (no credits): strict gate (rtt ≤ base + quarter).
+    //     cwnd is the only brake on inflight, so a looser gate causes the
+    //     classic 100-way-incast trim storm.
+    //   - FASTFLOW+EQDS (credits on): relaxed gate (rtt < target_rtt). cwnd
+    //     here drives pull_target (the credit horizon); actual sends are
+    //     credit-gated by the pacer at line rate. Relaxing FI lets cwnd ramp
+    //     fast enough to keep pull_target ahead of credits_issued so the
+    //     sink/pacer never go idle — matching EQDS's cwnd→pull_target loop.
     bool clean = !ack.ecn_echo();
     simtime_picosec rtt = _rtt;
-    bool rtt_near_base = (rtt == 0) ||
-                         (rtt <= _base_rtt + (_target_rtt - _base_rtt) / 4);
+    bool rtt_near_base;
+    if (_enable_credits) {
+        rtt_near_base = (rtt == 0) || (rtt < _target_rtt);
+    } else {
+        rtt_near_base = (rtt == 0) ||
+                        (rtt <= _base_rtt + (_target_rtt - _base_rtt) / 4);
+    }
 
     if (clean && rtt_near_base) {
         uint64_t new_bytes = (ack.ackno() > _last_acked)
@@ -427,7 +453,18 @@ void
 FastflowSrc::clamp_cwnd() {
     uint32_t hi = (uint32_t)(_bdp_bytes * 1.25);
     if (_cwnd > hi) _cwnd = hi;
-    if (_cwnd < _mtu) _cwnd = _mtu;
+    // In credit mode, keep cwnd at least pacer-grant-rate × RTT for the
+    // worst-case (100-way) incast. The pacer aggregates to line rate, so per
+    // sender at N=100 → 1 BDP/100 = ~3 MTU of credit arrives per RTT. If cwnd
+    // drops below this (e.g. QuickAdapt collapse), the inflight gate would
+    // throttle sends below what the pacer authorized, idling the link → the
+    // root cause of the large-incast hybrid degradation (the "up-then-down"
+    // curve). Keeping cwnd ≥ BDP/100 ensures the cwnd gate never throttles
+    // below the pacer's per-sender grant rate.
+    uint32_t lo = _enable_credits
+                      ? std::max((uint32_t)_mtu, (uint32_t)(_bdp_bytes / 100))
+                      : (uint32_t)_mtu;
+    if (_cwnd < lo) _cwnd = lo;
 }
 
 void
@@ -562,6 +599,18 @@ FastflowSrc::message_is_healthy(simtime_picosec now) const {
 // ===========================================================================
 bool
 FastflowSrc::can_send_one_mtu() const {
+    // Both gates are needed:
+    //   - cwnd gate: bounds inflight per-sender. Without it, credit accumulation
+    //     in permutation (1 sender per dest, pacer grants line rate to single
+    //     sink) lets the sender burst BDP worth of data into the oversubscribed
+    //     core, triggering a trim storm.
+    //   - credit gate: bounds inflight by what the receiver pacer authorized.
+    //     The pacer enforces fair sharing in incast (N senders share line rate
+    //     via round-robin grants).
+    // The clamp_cwnd floor (BDP/64 in credit mode) ensures cwnd doesn't fall
+    // below pacer-grant-rate × RTT (~3-5 MTU at line/100), so cwnd never
+    // throttles below what the pacer authorized — fixing the large-incast
+    // degradation while preserving rate control.
     uint64_t inflight = (_highest_sent > _last_acked)
                          ? (_highest_sent - _last_acked) : 0;
     if (inflight + _mtu > _cwnd) return false;
@@ -597,6 +646,17 @@ FastflowSrc::send_next_packet() {
     FastflowPacket* p = FastflowPacket::newpkt(_flow, *_route,
                                                _highest_sent + 1, sz);
     p->set_ts(eventlist().now());
+    // Advertise desired credit horizon: highest_sent + BDP.
+    // Pre-issuing BDP credits ahead of the current send position keeps the
+    // pacer continuously granting (sink's backlog never reaches zero), and
+    // the monotonic update_pull_target at the sink ensures the horizon never
+    // retreats even when cwnd oscillates due to congestion signals.
+    if (_enable_credits) {
+        uint64_t want = _highest_sent + (uint64_t)_bdp_bytes;
+        p->set_pull_target((want < _flow_size) ? want : _flow_size);
+    } else {
+        p->set_pull_target(0);
+    }
     p->flow().logTraffic(*p, *this, TrafficLogger::PKT_CREATESEND);
     _highest_sent += sz;
     _packets_sent += 1;
@@ -701,8 +761,8 @@ FastflowSink::FastflowSink()
       _src(NULL), _route_back(NULL),
       _cumulative_ack(0), _drops(0),
       _bytes_received_window(0), _bytes_received_last_window(0), _window_start(0),
-      _credit_mode(false), _host_linkspeed(0),
-      _next_credit_time(0), _credit_quantum(FastflowSrc::_mtu),
+      _pacer(NULL), _pull_target(0), _credits_issued(0),
+      _in_active_queue(false), _in_rtx_queue(false),
       _coflow_id(NO_COFLOW), _sender_id(0),
       _bytes_received_total(0)
 {
@@ -727,9 +787,13 @@ FastflowSink::set_coflow(CoflowId cid, SenderId sid) {
 }
 
 void
-FastflowSink::enable_credit_mode(linkspeed_bps host_linkspeed) {
-    _credit_mode = true;
-    _host_linkspeed = host_linkspeed;
+FastflowSink::update_pull_target(uint64_t new_pt) {
+    // Pull target only moves forward: as the sender's position advances,
+    // its desired credit horizon grows. Decreasing the target would stall
+    // the pacer — any excess credits the sender holds are harmless because
+    // cwnd still gates actual sends via can_send_one_mtu().
+    if (new_pt > _pull_target)
+        _pull_target = new_pt;
 }
 
 void
@@ -760,6 +824,13 @@ FastflowSink::receivePacket(Packet& pkt) {
     if (pkt.header_only()) {
         _drops++;
         send_ack(*p, /*trimmed=*/true, now);
+        // RTX priority: jump to front of pacer queue so the retransmit's
+        // follow-on new data gets credit ahead of non-retransmitting senders.
+        if (_pacer && !_in_rtx_queue) {
+            _in_rtx_queue = true;
+            _in_active_queue = false;
+            _pacer->request_rtx(this);
+        }
         p->free();
         return;
     }
@@ -801,13 +872,7 @@ FastflowSink::receivePacket(Packet& pkt) {
 void
 FastflowSink::send_ack(FastflowPacket& pkt, bool trimmed, simtime_picosec now) {
     bool ecn = (pkt.flags() & ECN_CE) != 0;
-    // For trim ACKs we report the seqno of the trimmed packet so the source
-    // can retransmit *that specific* packet rather than blindly resending
-    // _last_acked + 1 (which storms when several packets are trimmed).
     FastflowPacket::seq_t trim_sq = trimmed ? pkt.seqno() : 0;
-    // Report the last COMPLETED window — stable and non-zero even when the
-    // current window has just started. The sender's QuickAdapt uses this to
-    // set cwnd = max(recv_bytes_trtt, MTU) * qa_scaling.
     uint64_t ra_qa_bytes = (_bytes_received_last_window > 0)
                                ? _bytes_received_last_window
                                : _bytes_received_window;
@@ -821,34 +886,104 @@ FastflowSink::send_ack(FastflowPacket& pkt, bool trimmed, simtime_picosec now) {
     ack->flow().logTraffic(*ack, *this, TrafficLogger::PKT_CREATESEND);
     ack->sendOn();
 
-    // Idea 1: if in credit mode, opportunistically piggy-back a credit grant.
-    issue_credit_if_due(now);
+    // For normal (non-trimmed) data packets: update pull target from the
+    // sender's advertised cwnd and request credit if there is backlog.
+    // Trimmed packets are handled in receivePacket (RTX queue path).
+    if (!trimmed && _pacer && pkt.pull_target() > 0) {
+        update_pull_target(pkt.pull_target());
+        if (backlog() > 0 && !_in_active_queue && !_in_rtx_queue) {
+            _in_active_queue = true;
+            _pacer->request_active(this);
+        }
+    }
 }
 
 void
-FastflowSink::issue_credit_if_due(simtime_picosec now) {
-    if (!_credit_mode) return;
+FastflowSink::send_pull_credit() {
     if (!_route_back || !_src) return;
+    _in_active_queue = false;
+    _in_rtx_queue    = false;
 
-    // Reactive credit: issue 1 MTU per data packet received so the sender
-    // keeps its pipeline full without a timer gap. Coflow-aware shaping
-    // (Idea 2) can halve/double the grant for leader/straggler flows.
-    // The sender's cwnd is still the primary throttle; credits are a second
-    // gate that prevents sender-side bufferbloat at the source NIC queue.
-    uint32_t fair_q     = FastflowSrc::_mtu;
-    uint32_t priority_q = (uint32_t)(_credit_quantum * 2);
+    uint64_t grant = std::min((uint64_t)FastflowSrc::_mtu, backlog());
+    if (grant == 0) return;
 
-    uint32_t grant = fair_q;
-    if (_coflow_id != NO_COFLOW &&
-        CoflowRegistry::instance().policy() == COFLOW_ASYMMETRIC) {
-        grant = CoflowRegistry::instance().credit_for(_coflow_id, _sender_id,
-                                                      fair_q, priority_q);
+    _credits_issued += grant;
+    FastflowPull* pull = FastflowPull::newpkt(_src->flow(), *_route_back,
+                                              (uint32_t)grant);
+    pull->sendOn();
+}
+
+// ===========================================================================
+//                        FastflowPullPacer
+// ===========================================================================
+FastflowPullPacer::FastflowPullPacer(linkspeed_bps linkspeed, uint16_t mtu,
+                                     EventList& el)
+    : EventSource(el, "fastflow_pull_pacer"), _running(false)
+{
+    // Time to transmit one MTU at 99% of link speed (mirrors EqdsPullPacer).
+    _pkt_time = (simtime_picosec)(0.99 * (double)mtu * 8.0
+                                  / (double)linkspeed * 1e12);
+}
+
+bool
+FastflowPullPacer::in_rtx_queue(FastflowSink* s) const {
+    for (auto* p : _rtx_queue) if (p == s) return true;
+    return false;
+}
+
+bool
+FastflowPullPacer::in_active_queue(FastflowSink* s) const {
+    for (auto* p : _active_queue) if (p == s) return true;
+    return false;
+}
+
+void
+FastflowPullPacer::request_rtx(FastflowSink* sink) {
+    if (in_rtx_queue(sink)) return;
+    _rtx_queue.push_back(sink);
+    if (!_running) {
+        _running = true;
+        eventlist().sourceIsPendingRel(*this, 0);
     }
-    if (grant > 0) {
-        FastflowPull* pull = FastflowPull::newpkt(_src->flow(), *_route_back,
-                                                  grant);
-        pull->sendOn();
+}
+
+void
+FastflowPullPacer::request_active(FastflowSink* sink) {
+    if (in_active_queue(sink)) return;
+    _active_queue.push_back(sink);
+    if (!_running) {
+        _running = true;
+        eventlist().sourceIsPendingRel(*this, 0);
     }
+}
+
+void
+FastflowPullPacer::doNextEvent() {
+    FastflowSink* sink = NULL;
+
+    if (!_rtx_queue.empty()) {
+        sink = _rtx_queue.front();
+        _rtx_queue.pop_front();
+        sink->send_pull_credit();
+        // Re-enqueue in active if it still has backlog after the credit grant.
+        if (sink->backlog() > 0 && !in_active_queue(sink)) {
+            sink->_in_active_queue = true;
+            _active_queue.push_back(sink);
+        }
+    } else if (!_active_queue.empty()) {
+        sink = _active_queue.front();
+        _active_queue.pop_front();
+        sink->send_pull_credit();
+        if (sink->backlog() > 0 && !in_active_queue(sink)) {
+            sink->_in_active_queue = true;
+            _active_queue.push_back(sink);
+        }
+    } else {
+        _running = false;
+        return;
+    }
+
+    eventlist().sourceIsPendingRel(*this, _pkt_time);
 }
 
 // ===========================================================================

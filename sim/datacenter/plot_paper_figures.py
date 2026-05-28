@@ -33,16 +33,13 @@ PROTOCOLS = [
     "eqds",
     "fastflow",
     "fastflow+eqds",
-    "fastflow+eqds+mcc+coflow",
 ]
 
-# Incast only compares FASTFLOW variants (pure EQDS uses different cwnd defaults
-# that cause burst-induced trim and would need separate parameter tuning)
 PROTOCOLS_INCAST = [
     "swift",
+    "eqds",
     "fastflow",
     "fastflow+eqds",
-    "fastflow+eqds+mcc+coflow",
 ]
 
 PROTO_DIRS = {
@@ -99,6 +96,7 @@ plt.rcParams.update({
 
 LINKSPEED_BPS = 800e9      # 800 Gbps
 MTU_B = 4096
+BASE_RTT_US = 7.7          # Measured empty-network RTT in the simulator (3-tier fat tree)
 
 def ideal_single_fct_us(size_bytes):
     return size_bytes / (LINKSPEED_BPS / 8) * 1e6
@@ -181,10 +179,10 @@ def plot_fig5_incast(results_dir, plots_dir):
     for ax_idx, deg in enumerate(degrees):
         ax = axes[ax_idx]
 
-        # First pass: compute mean FCT — only include runs where ≥ 80% of flows
+        # First pass: compute max FCT — only include runs where ≥ 80% of flows
         # complete. Protocols with severe failure (< 80% completion) are excluded
         # at that (degree, size) point to avoid artificial spikes from lucky flows.
-        mean_fcts = {}  # (proto, siz_kib) -> mean_fct_us
+        max_fcts = {}  # (proto, siz_kib) -> max_fct_us
         MIN_COMPLETION = 0.80
         for proto in PROTOCOLS_INCAST:
             for siz_kib in sizes_kib:
@@ -193,18 +191,21 @@ def plot_fig5_incast(results_dir, plots_dir):
                     f"incast_{deg}deg_{siz_kib}KiB.fct")
                 data = load_fct(fct_file)
                 if data and len(data) >= deg * MIN_COMPLETION:
-                    mean_fcts[(proto, siz_kib)] = sum(data) / len(data)
+                    max_fcts[(proto, siz_kib)] = max(data)
 
-        # Second pass: normalize to THEORETICAL BEST (perfect fair serialization)
-        # theo_best = d × flow_size / link_bw  (all d flows sharing the link fairly)
-        # normalized = 1.0 means the protocol achieved perfect throughput
+        # Second pass: normalize to THEORETICAL BEST
+        # Paper formula: theo_best = d × size / link_bw (pure serialization)
+        # This naturally stays below 1.0 because actual FCT includes propagation
+        # delay. For small flows where serialization << RTT, the ratio dips low
+        # (RTT-dominated regime) — this matches the original paper's behavior.
+        # Using max_fct (last flow to finish) is the correct incast metric.
         for proto in PROTOCOLS_INCAST:
             xs, ys = [], []
             for siz_kib in sizes_kib:
-                if (proto, siz_kib) not in mean_fcts:
+                if (proto, siz_kib) not in max_fcts:
                     continue
                 theo_best_us = deg * siz_kib * 1024 / (LINKSPEED_BPS / 8) * 1e6
-                normalized = theo_best_us / mean_fcts[(proto, siz_kib)]
+                normalized = theo_best_us / max_fcts[(proto, siz_kib)]
                 xs.append(siz_kib)
                 ys.append(normalized)
 
@@ -222,7 +223,7 @@ def plot_fig5_incast(results_dir, plots_dir):
         if ax_idx == 0:
             ax.set_ylabel("Normalized to Theo. Best")
         ax.set_title(degree_titles[deg])
-        ax.set_ylim(0.50, 1.02)
+        ax.set_ylim(0.4, 1.05)
         ax.set_xlim(3, 40000)
         ax.xaxis.set_major_formatter(
             ticker.FuncFormatter(lambda x, _: f"$2^{{{int(np.log2(x))}}}$" if x >= 1 else ""))
@@ -501,9 +502,6 @@ def main():
 
     print("\nFig 8: Permutation CDF (bisect scenarios)")
     plot_fig8_permutation(args.results_dir, args.plots_dir)
-
-    print("\nFig 9: Alltoall bar chart")
-    plot_fig9_alltoall(args.results_dir, args.plots_dir)
 
     print("\nFig 10: FASTFLOW+EQDS permutation")
     plot_fig10_eqds_fastflow(args.results_dir, args.plots_dir)

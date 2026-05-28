@@ -35,6 +35,7 @@ public:
         p->_seqno = seqno;
         p->_syn = false;
         p->_ts = 0;
+        p->_pull_target = 0;
         return p;
     }
 
@@ -52,12 +53,15 @@ public:
     inline simtime_picosec ts() const { return _ts; }
     inline void set_ts(simtime_picosec ts) { _ts = ts; }
     inline bool is_syn() const { return _syn; }
+    inline uint64_t pull_target() const { return _pull_target; }
+    inline void set_pull_target(uint64_t pt) { _pull_target = pt; }
     virtual PktPriority priority() const { return Packet::PRIO_LO; }
 
 protected:
     seq_t _seqno;
     bool _syn;
     simtime_picosec _ts;
+    uint64_t _pull_target;  // sender's current cwnd (0 = credits disabled)
     static PacketDB<FastflowPacket> _packetdb;
 };
 

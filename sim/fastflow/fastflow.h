@@ -36,6 +36,7 @@ class FastflowSink;
 class FastflowSrc;
 class FastflowRtxTimerScanner;
 class FastflowPacer;
+class FastflowPullPacer;
 
 // ===========================================================================
 // FastflowPacer — runs the source in paced mode when cwnd drops below 1 MTU.
@@ -103,6 +104,7 @@ public:
     static bool _enable_credits;   // Idea 1: gate sends on receiver credits
     static bool _enable_mcc;       // Idea 1: message-level CC override
     static bool _trim_supported;   // if false, double _md and rely on timeouts
+    static bool _blast_start;      // start cwnd at BDP and let trimming settle it
 
     // For workload-aware MCC: target bandwidth per flow (bytes/sec)
     void set_msg_target_bw(double bytes_per_sec) { _msg_target_bw = bytes_per_sec; }
@@ -229,10 +231,40 @@ private:
 };
 
 // ===========================================================================
+// FastflowPullPacer — per-destination rate-limited credit scheduler.
+//
+// One instance is created per destination node and shared across all
+// FastflowSinks for flows terminating at that node. By serialising credit
+// grants to at most one per MTU-transmission-time, this prevents the
+// simultaneous-blast incast storm that occurs when all N senders try to
+// fill the receiver queue at once.
+//
+// Mirrors EqdsPullPacer but operates on FastflowSink* and emits
+// FastflowPull packets instead of EqdsPullPackets.
+// ===========================================================================
+class FastflowPullPacer : public EventSource {
+public:
+    FastflowPullPacer(linkspeed_bps linkspeed, uint16_t mtu, EventList& el);
+    virtual void doNextEvent();
+    void request_active(FastflowSink* sink);  // sink has new pull_target > credits_issued
+    void request_rtx(FastflowSink* sink);     // sink needs RTX credit (prioritised)
+
+private:
+    std::list<FastflowSink*> _rtx_queue;
+    std::list<FastflowSink*> _active_queue;
+    simtime_picosec _pkt_time;  // time to transmit one MTU at linkspeed * 0.99
+    bool _running;
+
+    bool in_rtx_queue(FastflowSink* s) const;
+    bool in_active_queue(FastflowSink* s) const;
+};
+
+// ===========================================================================
 // FastflowSink — the receiver.
 // ===========================================================================
 class FastflowSink : public PacketSink, public Logged {
     friend class FastflowSrc;
+    friend class FastflowPullPacer;
 
 public:
     FastflowSink();
@@ -244,9 +276,17 @@ public:
     // Idea 2: register this sink as part of a coflow.
     void set_coflow(CoflowId cid, SenderId sid);
 
-    // Idea 1: credit-grant emission (called periodically when credits enabled).
-    void enable_credit_mode(linkspeed_bps host_linkspeed);
-    void issue_credit_if_due(simtime_picosec now);
+    // Idea 1: attach a pull pacer (one per destination node).
+    void set_pacer(FastflowPullPacer* pacer) { _pacer = pacer; }
+
+    // Called by FastflowPullPacer when this sink is scheduled: sends one MTU
+    // of credit to the sender.
+    void send_pull_credit();
+
+    // Credit backlog: how many more bytes of credit the sender wants.
+    uint64_t backlog() const {
+        return (_pull_target > _credits_issued) ? (_pull_target - _credits_issued) : 0;
+    }
 
     uint64_t cumulative_ack() const { return _cumulative_ack; }
     uint32_t drops()          const { return _drops; }
@@ -266,11 +306,12 @@ protected:
     uint64_t _bytes_received_last_window;  // previous completed window (stable)
     simtime_picosec _window_start;
 
-    // Credit mode (Idea 1)
-    bool _credit_mode;
-    linkspeed_bps _host_linkspeed;
-    simtime_picosec _next_credit_time;
-    uint32_t _credit_quantum;          // default ~1 MTU per RTT/N
+    // Pacer-based credit state (Idea 1)
+    FastflowPullPacer* _pacer;
+    uint64_t _pull_target;      // sender's current cwnd (from data packet header)
+    uint64_t _credits_issued;   // cumulative credit bytes granted to this sender
+    bool _in_active_queue;      // guard: prevents double-enqueue in active queue
+    bool _in_rtx_queue;         // guard: prevents double-enqueue in rtx queue
 
     // Coflow membership (Idea 2)
     CoflowId _coflow_id;
@@ -280,6 +321,7 @@ protected:
 private:
     void send_ack(FastflowPacket& pkt, bool trimmed, simtime_picosec now);
     void update_recv_window(uint32_t pkt_size, simtime_picosec now);
+    void update_pull_target(uint64_t new_pt);  // updates _pull_target; resets epoch on decrease
 };
 
 // ===========================================================================

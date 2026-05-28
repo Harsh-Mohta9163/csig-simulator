@@ -1,19 +1,18 @@
 #!/bin/bash
 # run_paper_eval.sh
-# Run ALL paper scenarios from Bonato et al. 2024 (FASTFLOW paper).
-# Protocols: swift, fastflow, fastflow+eqds, fastflow+eqds+mcc, fastflow+eqds+mcc+coflow
-# All protocols: trimming ON, PLB ON (equal footing, paper Sec 4).
+# Run paper scenarios from Bonato et al. 2024 (FASTFLOW paper).
+# Protocols: swift, eqds, fastflow, fastflow+eqds
+# All protocols: trimming ON, PLB/ECMP ON (equal footing, paper Sec 4).
+# All 800Gbps link speed (-linkspeed 800000 passed to every binary).
 #
-# Topologies (from paper):
-#   Incast        -> non-blocking 1024-node (paper: "Incasts run without oversubscription")
-#   Permutation   -> 8:1 oversubscribed 1024-node (Fig 1,8)
-#   Alltoall      -> 8:1 oversubscribed  128-node (Fig 9)
+# Topologies:
+#   Incast      -> non-blocking 1024-node (paper: "Incasts run without oversubscription")
+#   Permutation -> 2:1/4:1/8:1 oversubscribed 1024-node (Fig 8, Fig 10)
 #
-# Figures reproduced:
-#   Fig 1/8 : permutation CDF (2MiB and 32MiB; OS2/OS4/OS8)
-#   Fig 5   : incast relative FCT (8/32/100-deg x 512KiB/4MiB/32MiB)
-#   Fig 9   : alltoall bar chart (k=1/2/8/16)
-#   Fig 10  : EQDS augmented permutation (2MiB and 32MiB+64MiB)
+# Figures:
+#   Fig 5   : incast relative FCT (8/32/100-deg x 14 sizes)
+#   Fig 8   : permutation CDF (different OS ratios and scenarios)
+#   Fig 10  : EQDS augmented permutation (2MiB and 32MiB)
 #
 # Usage: ./run_paper_eval.sh [--jobs N]
 # Run from sim/datacenter/
@@ -21,15 +20,14 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-# Clean up any leftover simulator logfiles (they grow to GB; we redirect to /dev/null)
 trap 'find . -name "logout.dat" -delete 2>/dev/null; true' EXIT
 
 FF_BIN="./htsim_fastflow"
 SW_BIN="./htsim_swift"
+EQ_BIN="./htsim_eqds"
 JOBS=4
 RESULTS="results/paper"
 
-# Parse optional args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jobs) JOBS="$2"; shift 2 ;;
@@ -37,18 +35,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-mkdir -p "$RESULTS"/{incast,permutation,alltoall}/{swift,fastflow,fastflow_eqds,fastflow_eqds_mcc,fastflow_eqds_mcc_coflow}
+mkdir -p "$RESULTS"/{incast,permutation}/{swift,eqds,fastflow,fastflow_eqds}
 
 TOPO_NB="topologies/fat_tree_1024_800g_nb.topo"
 TOPO_OS2="topologies/fat_tree_1024_800g_os2.topo"
 TOPO_OS4="topologies/fat_tree_1024_800g_os4.topo"
 TOPO_OS8="topologies/fat_tree_1024_800g_os8.topo"
-TOPO_128_OS8="topologies/fat_tree_128_800g_os8.topo"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: compute endtime in microseconds (capped at 2s)
-# Usage: endtime_us <degree> <size_bytes>
-# ─────────────────────────────────────────────────────────────────────────────
 endtime_us() {
     local deg="$1" siz="$2"
     python3 -c "print(max(5000, min(2000000, int($deg * $siz * 8 / 800000000 * 1e6 * 20 + 5000))))"
@@ -57,7 +50,6 @@ export -f endtime_us
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INCAST (Fig 5) — NON-BLOCKING 1024-node topology
-# degrees: 8, 32, 100  |  sizes: 512KiB, 4MiB, 32MiB
 # ─────────────────────────────────────────────────────────────────────────────
 run_incast() {
     local proto="$1" deg="$2" siz_kib="$3"
@@ -77,15 +69,25 @@ run_incast() {
         "$SW_BIN" \
             -topo "$TOPO_NB" \
             -tm "$cm" \
-            -mtu 4096 -q 500 \
+            -mtu 4096 -q 500 -linkspeed 800000 \
             -plb on -subflows 1 -trimming on \
             -end "$end" -o /dev/null \
             > >(grep "^FCT" > "$fct") 2>/dev/null
+    elif [[ "$proto" == "eqds" ]]; then
+        "$EQ_BIN" \
+            -topo "$TOPO_NB" \
+            -tm "$cm" \
+            -mtu 4096 -q 500 -linkspeed 800000 \
+            -cwnd 1 \
+            -strat ecmp_host -queue_type composite \
+            -fct_log \
+            -end "$end" -o /dev/null \
+            > >(grep "^FCT" > "$fct") 2>/dev/null || true
     else
         "$FF_BIN" \
             -topo "$TOPO_NB" \
             -tm "$cm" \
-            -mtu 4096 -q 500 \
+            -mtu 4096 -q 500 -linkspeed 800000 \
             -mode "$proto" \
             -plb on -trimming on \
             -end "$end" -o /dev/null \
@@ -95,13 +97,13 @@ run_incast() {
     echo "[done] incast/$proto/$label: ${n}/${deg}"
 }
 export -f run_incast
-export FF_BIN SW_BIN TOPO_NB RESULTS
+export FF_BIN SW_BIN EQ_BIN TOPO_NB RESULTS
 
-echo "=== Fig 5: Incast (non-blocking, PLB on) ==="
+echo "=== Fig 5: Incast (non-blocking, 800Gbps) ==="
 INCAST_CMDS=()
-for proto in swift fastflow "fastflow+eqds" "fastflow+eqds+mcc"; do
+for proto in swift eqds fastflow "fastflow+eqds"; do
     for deg in 8 32 100; do
-        for siz in 512 4096 32768; do
+        for siz in 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768; do
             INCAST_CMDS+=("$proto $deg $siz")
         done
     done
@@ -109,118 +111,83 @@ done
 printf '%s\n' "${INCAST_CMDS[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_incast $@' _ {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PERMUTATION (Fig 1, 8) — oversubscribed 1024-node
+# PERMUTATION (Fig 8, 10) — oversubscribed 1024-node
+# run_perm proto label cm topo_file endtime_us
 # ─────────────────────────────────────────────────────────────────────────────
 run_perm() {
-    local proto="$1" topo_tag="$2" topo="$3" siz_mib="$4"
-    local cm="connection_matrices/perm_1024n_1024c_${siz_mib}MiB.cm"
+    local proto="$1" label="$2" cm="$3" topo="$4" end="$5"
     [[ -f "$cm" ]] || { echo "[skip] missing $cm"; return 0; }
 
     local out="$RESULTS/permutation/${proto//+/_}"
     mkdir -p "$out"
-    local label="perm_${topo_tag}_${siz_mib}MiB"
     local fct="$out/${label}.fct"
     [[ -s "$fct" ]] && { echo "[cached] permutation/$proto/$label"; return 0; }
-
-    # endtime: target ~3s for 32MiB, 1s for 2MiB
-    local end=$(python3 -c "import math; print(min(5000000, max(500000, $siz_mib * 1024 * 1024 * 8 * 20 // 800000000 + 500000)))")
 
     if [[ "$proto" == "swift" ]]; then
         "$SW_BIN" \
             -topo "$topo" \
             -tm "$cm" \
-            -mtu 4096 -q 500 \
+            -mtu 4096 -q 500 -linkspeed 800000 \
             -plb on -subflows 1 -trimming on \
             -end "$end" -o /dev/null \
             > >(grep "^FCT" > "$fct") 2>/dev/null
+    elif [[ "$proto" == "eqds" ]]; then
+        "$EQ_BIN" \
+            -topo "$topo" \
+            -tm "$cm" \
+            -mtu 4096 -q 500 -linkspeed 800000 \
+            -cwnd 1 \
+            -strat ecmp_host -queue_type composite \
+            -fct_log \
+            -end "$end" -o /dev/null \
+            > >(grep "^FCT" > "$fct") 2>/dev/null || true
     else
         "$FF_BIN" \
             -topo "$topo" \
             -tm "$cm" \
             -mode "$proto" \
-            -mtu 4096 -q 500 \
+            -mtu 4096 -q 500 -linkspeed 800000 \
             -plb on -trimming on \
             -end "$end" -o /dev/null \
             > >(grep "^FCT" > "$fct") 2>/dev/null
     fi
     local n; n=$(wc -l < "$fct")
-    echo "[done] permutation/$proto/$label: ${n}/1024"
+    echo "[done] permutation/$proto/$label: ${n}"
 }
 export -f run_perm
 export TOPO_OS2 TOPO_OS4 TOPO_OS8
 
+CM_2M="connection_matrices/perm_1024n_1024c_2MiB.cm"
+CM_32M="connection_matrices/perm_1024n_1024c_32MiB.cm"
+CM_2M_BISECT="connection_matrices/perm_1024n_1024c_2MiB_bisect.cm"
+CM_2M_ONE4M="connection_matrices/perm_1024n_1024c_2MiB_one4MiB.cm"
+CM_4X4M="connection_matrices/perm_1024n_1024c_4x4MiB.cm"
+export CM_2M CM_32M CM_2M_BISECT CM_2M_ONE4M CM_4X4M
+
 echo ""
-echo "=== Fig 1/8: Permutation (oversubscribed, PLB on) ==="
+echo "=== Fig 8/10: Permutation (oversubscribed, 800Gbps) ==="
 PERM_CMDS=()
-for proto in swift fastflow "fastflow+eqds" "fastflow+eqds+mcc"; do
-    # Fig 1: 8:1 OS, 2MiB and 32MiB
-    PERM_CMDS+=("$proto os8 $TOPO_OS8 2")
-    PERM_CMDS+=("$proto os8 $TOPO_OS8 32")
-    # Fig 8: different OS ratios, 2MiB
-    PERM_CMDS+=("$proto os2 $TOPO_OS2 2")
-    PERM_CMDS+=("$proto os4 $TOPO_OS4 2")
+for proto in swift eqds fastflow "fastflow+eqds"; do
+    PERM_CMDS+=("$proto perm_os2_2MiB          $CM_2M        $TOPO_OS2 500000")
+    PERM_CMDS+=("$proto perm_os2_32MiB         $CM_32M       $TOPO_OS2 3000000")
+    PERM_CMDS+=("$proto perm_os4_2MiB          $CM_2M        $TOPO_OS4 500000")
+    PERM_CMDS+=("$proto perm_os4_32MiB         $CM_32M       $TOPO_OS4 3000000")
+    PERM_CMDS+=("$proto perm_os8_2MiB          $CM_2M        $TOPO_OS8 500000")
+    PERM_CMDS+=("$proto perm_os8_32MiB         $CM_32M       $TOPO_OS8 3000000")
+    PERM_CMDS+=("$proto perm_os8_4x4MiB        $CM_4X4M      $TOPO_OS8 1000000")
+    PERM_CMDS+=("$proto perm_os8_2MiB_one4MiB  $CM_2M_ONE4M  $TOPO_OS8 1000000")
+    PERM_CMDS+=("$proto perm_os8_2MiB_bisect   $CM_2M_BISECT $TOPO_OS8 500000")
 done
 printf '%s\n' "${PERM_CMDS[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_perm $@' _ {}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ALLTOALL (Fig 9) — 128-node 8:1 oversubscribed, windowed k=1/2/8/16
-# ─────────────────────────────────────────────────────────────────────────────
-run_alltoall() {
-    local proto="$1" k="$2"
-    local cm="connection_matrices/a2a_128n_1MiB_k${k}.cm"
-    [[ -f "$cm" ]] || { echo "[skip] missing $cm"; return 0; }
-
-    local out="$RESULTS/alltoall/${proto//+/_}"
-    mkdir -p "$out"
-    local label="a2a_128n_k${k}"
-    local fct="$out/${label}.fct"
-    [[ -s "$fct" ]] && { echo "[cached] alltoall/$proto/$label"; return 0; }
-
-    # 128 nodes, 16256 connections each 1MiB.
-    # 5s endtime: complex protocols (eqds+mcc, coflow) need up to ~500ms sim time
-    # due to credit back-pressure; simpler protocols exit early when done.
-    local end=5000000  # 5s
-
-    if [[ "$proto" == "swift" ]]; then
-        "$SW_BIN" \
-            -topo "$TOPO_128_OS8" \
-            -tm "$cm" \
-            -mtu 4096 -q 500 \
-            -plb on -subflows 1 -trimming on \
-            -end "$end" -o /dev/null \
-            > >(grep "^FCT" > "$fct") 2>/dev/null
-    else
-        "$FF_BIN" \
-            -topo "$TOPO_128_OS8" \
-            -tm "$cm" \
-            -mode "$proto" \
-            -mtu 4096 -q 500 \
-            -plb on -trimming on \
-            -end "$end" -o /dev/null \
-            > >(grep "^FCT" > "$fct") 2>/dev/null
-    fi
-    local n; n=$(wc -l < "$fct")
-    echo "[done] alltoall/$proto/$label: ${n}/16256"
-}
-export -f run_alltoall
-export TOPO_128_OS8
-
-echo ""
-echo "=== Fig 9: Alltoall (128-node OS8, PLB on) ==="
-A2A_CMDS=()
-for proto in swift fastflow "fastflow+eqds" "fastflow+eqds+mcc" "fastflow+eqds+mcc+coflow"; do
-    for k in 1 2 8 16; do
-        A2A_CMDS+=("$proto $k")
-    done
-done
-printf '%s\n' "${A2A_CMDS[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_alltoall $@' _ {}
+# Alltoall evaluation is paused — not included in current run.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Summary ==="
-for wkld in incast permutation alltoall; do
+for wkld in incast permutation; do
     echo "  $wkld:"
     for d in "$RESULTS/$wkld"/*/; do
         proto=$(basename "$d")

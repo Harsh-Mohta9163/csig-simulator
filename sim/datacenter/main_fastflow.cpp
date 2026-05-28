@@ -17,6 +17,7 @@
 
 #include <iostream>
 #include <list>
+#include <map>
 #include <math.h>
 #include <sstream>
 #include <string.h>
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
     bool trimming = true;
     bool ra_qa = false;
     bool plb = true;  // paper: multi-pathing enabled for all algorithms
+    bool blast_start = false;
     bool use_credits = false;
     bool use_mcc = false;
     bool use_coflow = false;
@@ -97,9 +99,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-mtu"))     { packet_size = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-linkspeed")) { linkspeed = speedFromMbps(atof(argv[++i])); }
         else if (!strcmp(argv[i], "-end"))     { endtime = timeFromUs(atof(argv[++i])); }
-        else if (!strcmp(argv[i], "-trimming")) { trimming = flag_on(argv[++i]); }
-        else if (!strcmp(argv[i], "-plb"))     { plb = flag_on(argv[++i]); }
-        else if (!strcmp(argv[i], "-ra_qa"))   { ra_qa = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-trimming"))    { trimming = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-plb"))         { plb = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-ra_qa"))       { ra_qa = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-blast_start")) { blast_start = flag_on(argv[++i]); }
         else if (!strcmp(argv[i], "-mode")) {
             const char* m = argv[++i];
             if (!strcmp(m, "fastflow")) {
@@ -132,6 +135,7 @@ int main(int argc, char** argv) {
     FastflowSrc::_enable_credits = use_credits;
     FastflowSrc::_enable_mcc = use_mcc;
     FastflowSrc::_trim_supported = trimming;
+    FastflowSrc::_blast_start = blast_start;
     if (!trimming) FastflowSrc::_md_const = 4.0;
 
     CoflowRegistry::instance().reset();
@@ -233,6 +237,11 @@ int main(int argc, char** argv) {
         for (uint32_t b = 0; b < no_of_nodes; b++) net_paths[a][b] = NULL;
     }
 
+    // One pull pacer per destination node, shared across all senders targeting
+    // that node. This is the key to incast serialisation: N senders to the
+    // same destination share one pacer, so each gets credit at rate/N.
+    std::map<uint32_t, FastflowPullPacer*> dst_pacers;
+
     list<FastflowSrc*> srcs;
     list<FastflowSink*> sinks;
 
@@ -276,7 +285,12 @@ int main(int argc, char** argv) {
             src->set_msg_tolerance(msg_tolerance);
         }
 
-        if (use_credits) sink->enable_credit_mode(linkspeed);
+        if (use_credits) {
+            if (!dst_pacers.count(d)) {
+                dst_pacers[d] = new FastflowPullPacer(linkspeed, packet_size, eventlist);
+            }
+            sink->set_pacer(dst_pacers[d]);
+        }
 
         // Coflow membership: by convention use crt->recv_done_trigger as the
         // coflow id (a non-zero value means this connection participates).
