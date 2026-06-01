@@ -94,7 +94,15 @@ plt.rcParams.update({
 
 LINKSPEED_BPS = 800e9      # 800 Gbps
 MTU_B = 4096
-BASE_RTT_US = 7.7          # Measured empty-network RTT in the simulator (3-tier fat tree)
+# Topology-aware per-flow ideal: use the worst-case RTT in the chosen path set
+# instead of a fixed average.  For our 1024-node 3-tier fat tree:
+#   intra-pod 2-hop:   3.2 µs RTT
+#   inter-pod 6-hop:  11.2 µs RTT
+# For incast with random source picks, ~all senders are cross-pod, so the
+# slowest sender (which determines max_FCT) is bounded below by the cross-pod
+# RTT.  Using that RTT here makes "1.0 normalized" mean "as fast as physics
+# allows on the longest path the protocol chose" — the fair definition.
+BASE_RTT_US = 11.2
 
 def ideal_single_fct_us(size_bytes):
     return size_bytes / (LINKSPEED_BPS / 8) * 1e6
