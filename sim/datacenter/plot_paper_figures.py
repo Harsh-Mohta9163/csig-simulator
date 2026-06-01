@@ -94,14 +94,41 @@ plt.rcParams.update({
 
 LINKSPEED_BPS = 800e9      # 800 Gbps
 MTU_B = 4096
-# Topology-aware per-flow ideal: use the worst-case RTT in the chosen path set
-# instead of a fixed average.  For our 1024-node 3-tier fat tree:
-#   intra-pod 2-hop:   3.2 µs RTT
-#   inter-pod 6-hop:  11.2 µs RTT
-# For incast with random source picks, ~all senders are cross-pod, so the
-# slowest sender (which determines max_FCT) is bounded below by the cross-pod
-# RTT.  Using that RTT here makes "1.0 normalized" mean "as fast as physics
-# allows on the longest path the protocol chose" — the fair definition.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# True per-flow path RTT (option ii — per-flow ideal).
+# Topology: 1024 nodes, 16 pods × 64 hosts/pod, 8 ToRs/pod × 8 hosts/ToR.
+# Link latency 600ns, switch latency 400ns.
+# Path = host → link → ToR → ... → ToR → link → host
+#   same ToR (1 switch in path):   1 link + 0 (process) + 1 link → 1.6µs one-way = 3.2µs RTT
+#   same pod (3 switches):         3 links + 2 switches → 2.6µs one-way = ... wait
+# Recompute carefully:
+#   same ToR:     host → 1 link → ToR → 1 link → host          = 2 links + 1 sw   = 1.6µs → 3.2µs RTT
+#   same pod:     host → ToR → Agg → ToR → host                = 4 links + 3 sw   = 3.6µs → 7.2µs RTT
+#   diff pod:     host → ToR → Agg → Core → Agg → ToR → host   = 6 links + 5 sw   = 5.6µs → 11.2µs RTT
+NODES_PER_TOR = 8
+NODES_PER_POD = 64
+LINK_LAT_NS   = 600
+# NOTE: the topology *file* says Switch_Latency_ns 400 but
+# fat_tree_topology.cpp:195 parses only the lowercase token "switch_latency_ns",
+# so in practice switch latency is 0 in our runs. We use 0 here to match the
+# actual simulator behaviour (verified empirically: FASTFLOW 1-packet
+# cross-pod FCT = 7.45µs ≈ 6 × 600ns × 2 = 7.2µs RTT + ε serialization).
+SW_LAT_NS     = 0
+
+def path_rtt_us(src, dst):
+    """Empty-network RTT in µs for a flow from src to dst, as actually
+    delivered by the simulator (not the topo file's nominal config)."""
+    src, dst = int(src), int(dst)
+    if src // NODES_PER_TOR == dst // NODES_PER_TOR:
+        one_way_ns = 2 * LINK_LAT_NS + 1 * SW_LAT_NS   # same ToR
+    elif src // NODES_PER_POD == dst // NODES_PER_POD:
+        one_way_ns = 4 * LINK_LAT_NS + 3 * SW_LAT_NS   # same pod
+    else:
+        one_way_ns = 6 * LINK_LAT_NS + 5 * SW_LAT_NS   # cross-pod
+    return 2 * one_way_ns / 1000.0   # ns → µs
+
+# Fallback constant for places that still want a single "average" RTT.
 BASE_RTT_US = 11.2
 
 def ideal_single_fct_us(size_bytes):
@@ -123,6 +150,34 @@ def load_fct(path):
     except FileNotFoundError:
         return []
     data.sort()
+    return data
+
+
+def parse_src_dst(flow_name):
+    """Extract (src, dst) from names like 'fastflow_<src>_<dst>' or 'Eqds_<src>_<dst>'."""
+    # remove prefix up to first underscore, then split last two underscore-separated ints
+    parts = flow_name.split('_')
+    try:
+        return int(parts[-2]), int(parts[-1])
+    except (ValueError, IndexError):
+        return None, None
+
+
+def load_fct_with_paths(path):
+    """Return list of (src, dst, fct_us) tuples sorted by fct."""
+    data = []
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 10 and p[0] == "FCT":
+                    src, dst = parse_src_dst(p[1])
+                    if src is None:
+                        continue
+                    data.append((src, dst, float(p[7])))
+    except FileNotFoundError:
+        return []
+    data.sort(key=lambda t: t[2])
     return data
 
 
@@ -185,36 +240,34 @@ def plot_fig5_incast(results_dir, plots_dir):
     for ax_idx, deg in enumerate(degrees):
         ax = axes[ax_idx]
 
-        # First pass: compute max FCT — only include runs where ≥ 80% of flows
-        # complete. Protocols with severe failure (< 80% completion) are excluded
-        # at that (degree, size) point to avoid artificial spikes from lucky flows.
-        max_fcts = {}  # (proto, siz_kib) -> max_fct_us
+        # Per-flow ideal (option ii):
+        #   For each flow we extract (src,dst) and compute that flow's path-RTT.
+        #   The "slowest-flow ideal" = RTT of the actual slowest flow + drain time.
+        #   norm = slowest_flow_ideal / slowest_flow_FCT.
+        # This makes "1.0" mean "as fast as physics allows on the path the
+        # slowest sender actually took" — independent of which paths the
+        # protocol's faster senders happened to choose.
         MIN_COMPLETION = 0.80
+        slowest_per_scenario = {}  # (proto, siz_kib) -> (path_rtt_us, fct_us)
         for proto in PROTOCOLS_INCAST:
             for siz_kib in sizes_kib:
                 fct_file = os.path.join(
                     results_dir, "incast", PROTO_DIRS[proto],
                     f"incast_{deg}deg_{siz_kib}KiB.fct")
-                data = load_fct(fct_file)
-                if data and len(data) >= deg * MIN_COMPLETION:
-                    max_fcts[(proto, siz_kib)] = max(data)
+                pairs = load_fct_with_paths(fct_file)
+                if pairs and len(pairs) >= deg * MIN_COMPLETION:
+                    src, dst, fct = pairs[-1]  # sorted ascending — last is max
+                    slowest_per_scenario[(proto, siz_kib)] = (path_rtt_us(src, dst), fct)
 
-        # Second pass: normalize to THEORETICAL BEST (with RTT floor).
-        # theo_best = base_RTT + (deg × size) / link_bw
-        # The first term is the propagation floor: even with perfect CC a flow
-        # cannot complete faster than one RTT. The second term is the receiver
-        # link drain time (serialization of N senders' aggregate data).
-        # Without the RTT floor, small flows show artificially low normalized
-        # values (e.g. 0.04 for 4KiB) where 1.0 is physically impossible
-        # because serialization (0.3 µs) << RTT (7.7 µs).
         for proto in PROTOCOLS_INCAST:
             xs, ys = [], []
             for siz_kib in sizes_kib:
-                if (proto, siz_kib) not in max_fcts:
+                if (proto, siz_kib) not in slowest_per_scenario:
                     continue
+                rtt_us, fct_us = slowest_per_scenario[(proto, siz_kib)]
                 serialization_us = deg * siz_kib * 1024 / (LINKSPEED_BPS / 8) * 1e6
-                theo_best_us = BASE_RTT_US + serialization_us
-                normalized = theo_best_us / max_fcts[(proto, siz_kib)]
+                theo_best_us = rtt_us + serialization_us
+                normalized = theo_best_us / fct_us
                 xs.append(siz_kib)
                 ys.append(normalized)
 
