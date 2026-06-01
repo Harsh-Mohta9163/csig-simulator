@@ -78,7 +78,7 @@ run_incast() {
             -topo "$TOPO_NB" \
             -tm "$cm" \
             -mtu 4096 -q 500 -linkspeed 800000 \
-            -cwnd 1 \
+            -cwnd 32 \
             -strat ecmp_host -queue_type composite \
             -fct_log \
             -end "$end" -o /dev/null \
@@ -136,7 +136,7 @@ run_perm() {
             -topo "$topo" \
             -tm "$cm" \
             -mtu 4096 -q 500 -linkspeed 800000 \
-            -cwnd 1 \
+            -cwnd 32 \
             -strat ecmp_host -queue_type composite \
             -fct_log \
             -end "$end" -o /dev/null \

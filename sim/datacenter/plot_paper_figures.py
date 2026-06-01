@@ -191,18 +191,21 @@ def plot_fig5_incast(results_dir, plots_dir):
                 if data and len(data) >= deg * MIN_COMPLETION:
                     max_fcts[(proto, siz_kib)] = max(data)
 
-        # Second pass: normalize to THEORETICAL BEST
-        # Paper formula: theo_best = d × size / link_bw (pure serialization)
-        # This naturally stays below 1.0 because actual FCT includes propagation
-        # delay. For small flows where serialization << RTT, the ratio dips low
-        # (RTT-dominated regime) — this matches the original paper's behavior.
-        # Using max_fct (last flow to finish) is the correct incast metric.
+        # Second pass: normalize to THEORETICAL BEST (with RTT floor).
+        # theo_best = base_RTT + (deg × size) / link_bw
+        # The first term is the propagation floor: even with perfect CC a flow
+        # cannot complete faster than one RTT. The second term is the receiver
+        # link drain time (serialization of N senders' aggregate data).
+        # Without the RTT floor, small flows show artificially low normalized
+        # values (e.g. 0.04 for 4KiB) where 1.0 is physically impossible
+        # because serialization (0.3 µs) << RTT (7.7 µs).
         for proto in PROTOCOLS_INCAST:
             xs, ys = [], []
             for siz_kib in sizes_kib:
                 if (proto, siz_kib) not in max_fcts:
                     continue
-                theo_best_us = deg * siz_kib * 1024 / (LINKSPEED_BPS / 8) * 1e6
+                serialization_us = deg * siz_kib * 1024 / (LINKSPEED_BPS / 8) * 1e6
+                theo_best_us = BASE_RTT_US + serialization_us
                 normalized = theo_best_us / max_fcts[(proto, siz_kib)]
                 xs.append(siz_kib)
                 ys.append(normalized)
@@ -221,7 +224,7 @@ def plot_fig5_incast(results_dir, plots_dir):
         if ax_idx == 0:
             ax.set_ylabel("Normalized to Theo. Best")
         ax.set_title(degree_titles[deg])
-        ax.set_ylim(0.4, 1.05)
+        ax.set_ylim(0.2, 1.05)
         ax.set_xlim(3, 40000)
         ax.xaxis.set_major_formatter(
             ticker.FuncFormatter(lambda x, _: f"$2^{{{int(np.log2(x))}}}$" if x >= 1 else ""))

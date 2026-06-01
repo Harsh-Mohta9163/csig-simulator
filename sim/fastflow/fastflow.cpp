@@ -82,14 +82,13 @@ FastflowSrc::FastflowSrc(FastflowRtxTimerScanner& rtx_scanner,
     // Initial burst = 1 MTU when credits are enabled. This bootstraps the
     // credit loop: the first packet arrives at the receiver, which issues a
     // BDP-sized credit grant back to the sender. The grant fills the pipeline
-    // and subsequent 1:1 packet/credit maintains it.
-    // 1 MTU startup prevents incast burst storms (100 senders × 1 pkt is fine).
+    // Initial speculative burst — matches EQDS's _credit_spec = _maxwnd = 50×MTU.
+    // Small flows complete entirely from speculative credit (no credit handshake).
+    // Large flows: speculative is consumed in 1 RTT, then per-packet credit kicks in.
+    // For 50:1 incast: 50×50MTU = 2500 pkts vs 500-pkt queue → trim storm that
+    // QuickAdapt + RTS recovery resolves within a few RTTs.
     // When credits are disabled, allow unlimited sending (cwnd is the only gate).
-    // In credit mode: BDP/16 ≈ 18 MTUs initial burst bootstraps the credit
-    // pipeline.  For 100-way incast: 100×75KB=7.5MB causes an initial trim storm
-    // that QA quickly resolves.  For permutation: the burst fills the single-flow
-    // pipeline fast and avoids the multi-RTT credit ramp-up.  Vanilla: unlimited.
-    _initial_burst_remaining = _enable_credits ? (uint64_t)_mtu : ((uint64_t)1 << 62);
+    _initial_burst_remaining = _enable_credits ? (uint64_t)(8 * _mtu) : ((uint64_t)1 << 62);
     _receiver_credits = 0;
     _last_rts_time = 0;
     _last_credit_time = 0;
