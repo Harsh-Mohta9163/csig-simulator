@@ -29,6 +29,7 @@ bool     FastflowSrc::_enable_credits = false;
 bool     FastflowSrc::_enable_mcc     = false;
 bool     FastflowSrc::_trim_supported = true;
 bool     FastflowSrc::_blast_start    = false;
+bool     FastflowSrc::_reps_enabled   = true;   // paper §III-A: REPS is the default for SMaRTT
 
 // ===========================================================================
 //                        FastflowSrc — constructor
@@ -123,6 +124,17 @@ FastflowSrc::connect(const Route& routeout, const Route& routeback,
     new_route->push_back(&sink);
     _route = new_route;
     sink.connect(*this, routeback);
+
+    // Build per-path routes with sink appended for REPS spraying.
+    _reps_routes.clear();
+    if (!_paths.empty()) {
+        _reps_routes.reserve(_paths.size());
+        for (auto* p : _paths) {
+            Route* r = p->clone();
+            r->push_back(&sink);
+            _reps_routes.push_back(r);
+        }
+    }
 
     _start_time = starttime;
     if (starttime != TRIGGER_START) {
@@ -246,20 +258,32 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
     // double-emit (retransmit + new data per trim) and produce a multiplicative
     // storm because trims travel faster than clean ACKs.
     if (ack.is_trimmed()) {
+        // REPS: trimmed packet → this path is congested, do NOT recycle entropy.
         handle_trim(ack);
         clamp_cwnd();
         maybe_report_completion();
         return;
     }
 
+    // REPS path recycling — paper §III-A:
+    //   - non-ECN ACK ⇒ that path is currently clean, push to recycle queue.
+    //   - ECN-marked ACK ⇒ path is congested, drop the entropy.
+    if (_reps_enabled && !_reps_routes.empty() && !ack.ecn_echo()) {
+        if (_clean_entropies.size() < _clean_entropy_cap) {
+            _clean_entropies.push_back(ack.entropy() % _reps_routes.size());
+        }
+    }
+
     // RTT sample (timestamp echo)
     simtime_picosec rtt_sample = now - ack.ts_echo();
     update_rtt(rtt_sample);
 
-    // PLB / LOAD_BALANCER_PATH_CHANGE (paper Alg.1 ecn&&rtt<trtt case):
-    // switch ECMP path when ECN marks arrive but delay is still below target.
+    // LOAD_BALANCER_PATH_CHANGE (paper Alg.1 ecn&&rtt<trtt case):
+    // REPS handles path change per-packet via select_entropy() above.
+    // When REPS is disabled, PLB switches the single flow path on persistent
+    // congestion (legacy fallback).
     bool ecn_for_plb = ack.ecn_echo();
-    if (_plb && !_paths.empty() && _rtt > 0) {
+    if (!_reps_enabled && _plb && !_paths.empty() && _rtt > 0) {
         if (rtt_sample <= _target_rtt && !ecn_for_plb) {
             _plb_last_good = now;
             _plb_interval = (simtime_picosec)(random() % (2 * _rtt)) + 5 * _rtt;
@@ -531,7 +555,16 @@ FastflowSrc::retransmit_seqno(FastflowPacket::seq_t seqno) {
     if (seqno > _flow_size) return;
     uint32_t sz = std::min((uint32_t)_mtu,
                            (uint32_t)(_flow_size + 1 - seqno));
-    FastflowPacket* p = FastflowPacket::newpkt(_flow, *_route, seqno, sz);
+    // REPS: retransmits use a fresh random entropy (the original path was
+    // bad — the packet was trimmed).
+    const Route* route = _route;
+    uint32_t entropy = 0;
+    if (_reps_enabled && !_reps_routes.empty()) {
+        entropy = (uint32_t)(random() % _reps_routes.size());
+        route = _reps_routes[entropy];
+    }
+    FastflowPacket* p = FastflowPacket::newpkt(_flow, *route, seqno, sz);
+    p->set_entropy(entropy);
     p->set_ts(eventlist().now());
     if (_enable_credits) {
         uint64_t want = _last_acked + (uint64_t)_cwnd + (uint64_t)_mtu;
@@ -625,14 +658,37 @@ FastflowSrc::maybe_send_rts() {
     rts->sendOn();
 }
 
+// REPS path selection — paper §III-A.
+// Pop a recently-clean entropy if available, else pick a fresh random one.
+// Capacity-bounded deque acts as the "recycled" cache.
+uint32_t
+FastflowSrc::select_entropy() {
+    if (!_reps_enabled || _paths.empty()) return 0;
+    if (!_clean_entropies.empty()) {
+        uint32_t e = _clean_entropies.front();
+        _clean_entropies.pop_front();
+        return e;
+    }
+    return (uint32_t)(random() % _paths.size());
+}
+
 bool
 FastflowSrc::send_next_packet() {
     if (_highest_sent >= _flow_size) return false;
     uint32_t sz = std::min((uint32_t)_mtu,
                            (uint32_t)(_flow_size - _highest_sent));
 
-    FastflowPacket* p = FastflowPacket::newpkt(_flow, *_route,
+    // REPS: pick path per-packet (paper §III-A).
+    // Falls back to single _route when REPS is disabled or no path set exists.
+    const Route* route = _route;
+    uint32_t entropy = 0;
+    if (_reps_enabled && !_reps_routes.empty()) {
+        entropy = select_entropy();
+        route = _reps_routes[entropy % _reps_routes.size()];
+    }
+    FastflowPacket* p = FastflowPacket::newpkt(_flow, *route,
                                                _highest_sent + 1, sz);
+    p->set_entropy(entropy);
     p->set_ts(eventlist().now());
     // EQDS-style pull_target: last_acked + cwnd + mtu.
     // Limits outstanding credits to cwnd bytes ahead of the cumulative ack —
@@ -898,7 +954,8 @@ FastflowSink::send_ack(FastflowPacket& pkt, bool trimmed, simtime_picosec now) {
                                            pkt.ts(),
                                            ecn,
                                            trimmed,
-                                           ra_qa_bytes);
+                                           ra_qa_bytes,
+                                           pkt.entropy());   // REPS echo
     ack->flow().logTraffic(*ack, *this, TrafficLogger::PKT_CREATESEND);
     ack->sendOn();
 

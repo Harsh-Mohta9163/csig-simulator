@@ -37,6 +37,7 @@ public:
         p->_is_rts = false;
         p->_ts = 0;
         p->_pull_target = 0;
+        p->_entropy = 0;
         return p;
     }
 
@@ -73,6 +74,8 @@ public:
     inline bool is_rts() const { return _is_rts; }
     inline uint64_t pull_target() const { return _pull_target; }
     inline void set_pull_target(uint64_t pt) { _pull_target = pt; }
+    inline uint32_t entropy() const { return _entropy; }
+    inline void set_entropy(uint32_t e) { _entropy = e; }
     virtual PktPriority priority() const { return Packet::PRIO_LO; }
 
     const static int RTSSIZE = 40;  // lightweight control packet
@@ -83,6 +86,7 @@ protected:
     bool _is_rts;
     simtime_picosec _ts;
     uint64_t _pull_target;  // credit horizon advertised by sender
+    uint32_t _entropy;      // REPS path entropy (index into _paths)
     static PacketDB<FastflowPacket> _packetdb;
 };
 
@@ -94,7 +98,8 @@ public:
                                       seq_t ackno, seq_t trim_seqno,
                                       simtime_picosec ts_echo,
                                       bool ecn_echo, bool trimmed,
-                                      uint64_t recv_bytes_trtt = 0) {
+                                      uint64_t recv_bytes_trtt = 0,
+                                      uint32_t entropy = 0) {
         FastflowAck* p = _packetdb.allocPacket();
         p->set_route(flow, route, ACKSIZE, ackno);
         p->_type = SWIFTACK;
@@ -104,6 +109,7 @@ public:
         p->_ecn_echo = ecn_echo;
         p->_is_trimmed = trimmed;
         p->_recv_bytes_trtt = recv_bytes_trtt;
+        p->_entropy = entropy;
         return p;
     }
 
@@ -116,6 +122,7 @@ public:
     inline bool ecn_echo() const { return _ecn_echo; }
     inline bool is_trimmed() const { return _is_trimmed; }
     inline uint64_t recv_bytes_trtt() const { return _recv_bytes_trtt; }
+    inline uint32_t entropy() const { return _entropy; }
     inline void set_trimmed(bool t) { _is_trimmed = t; }
     inline void set_ecn_echo(bool e) { _ecn_echo = e; }
     inline void set_recv_bytes_trtt(uint64_t b) { _recv_bytes_trtt = b; }
@@ -130,6 +137,7 @@ protected:
     bool _ecn_echo;
     bool _is_trimmed;
     uint64_t _recv_bytes_trtt;
+    uint32_t _entropy;            // echoed REPS entropy from data packet
     static PacketDB<FastflowAck> _packetdb;
 };
 

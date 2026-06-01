@@ -17,6 +17,7 @@
 #ifndef FASTFLOW_H
 #define FASTFLOW_H
 
+#include <deque>
 #include <list>
 #include <map>
 #include <set>
@@ -94,6 +95,9 @@ public:
     static simtime_picosec _target_rtt;   // 1.5 × base_rtt (paper §III-J)
     static uint32_t _bdp_bytes;    // BDP in bytes for cwnd clamp
 
+    // REPS path selection (paper §III-A).
+    uint32_t select_entropy();
+
     // ====================== Feature toggles (CLI-driven) ===================
     static bool _enable_ra_qa;     // Idea 3: receiver-anchored QuickAdapt
     static bool _enable_credits;   // Idea 1: gate sends on receiver credits
@@ -125,9 +129,20 @@ protected:
     PacketFlow _flow;
     vector<const Route*> _paths;  // ECMP path pool
     uint32_t _path_index;
-    bool _plb;                          // PLB enabled
+    bool _plb;                          // PLB enabled (single-path fallback)
     simtime_picosec _plb_last_good;     // timestamp of last congestion-free ACK
     simtime_picosec _plb_interval;      // retry-path interval (randomised)
+
+    // REPS (Recycled Entropy Packet Spraying — paper §III-A) state.
+    // _clean_entropies caches path indices whose recent ACKs returned without
+    // ECN — re-use them in preference to picking random new ones.  Capacity
+    // bounded to keep buffer cost reasonable.
+    // _reps_routes mirrors _paths but with the sink appended so packets are
+    // delivered (matches what connect() does for _route).
+    static bool _reps_enabled;
+    std::vector<Route*> _reps_routes;
+    std::deque<uint32_t> _clean_entropies;
+    static constexpr size_t _clean_entropy_cap = 64;
 
     // --- Sending state ---
     uint64_t _highest_sent;       // highest seqno ever sent (bytes)
