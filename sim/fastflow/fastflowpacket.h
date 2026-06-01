@@ -34,8 +34,25 @@ public:
         p->_type = SWIFT;
         p->_seqno = seqno;
         p->_syn = false;
+        p->_is_rts = false;
         p->_ts = 0;
         p->_pull_target = 0;
+        return p;
+    }
+
+    // RTS (request-to-send) control packet: header-only, carries pull_target
+    // to the receiver so the pacer can issue credits when the sender is
+    // credit-blocked (no data packet to piggy-back on).
+    inline static FastflowPacket* new_rts_pkt(PacketFlow& flow, const Route& route,
+                                               uint64_t pull_target) {
+        FastflowPacket* p = _packetdb.allocPacket();
+        p->set_route(flow, route, RTSSIZE, 0);
+        p->_type = SWIFT;
+        p->_seqno = 0;
+        p->_syn = false;
+        p->_is_rts = true;
+        p->_ts = 0;
+        p->_pull_target = pull_target;
         return p;
     }
 
@@ -53,15 +70,19 @@ public:
     inline simtime_picosec ts() const { return _ts; }
     inline void set_ts(simtime_picosec ts) { _ts = ts; }
     inline bool is_syn() const { return _syn; }
+    inline bool is_rts() const { return _is_rts; }
     inline uint64_t pull_target() const { return _pull_target; }
     inline void set_pull_target(uint64_t pt) { _pull_target = pt; }
     virtual PktPriority priority() const { return Packet::PRIO_LO; }
 
+    const static int RTSSIZE = 40;  // lightweight control packet
+
 protected:
     seq_t _seqno;
     bool _syn;
+    bool _is_rts;
     simtime_picosec _ts;
-    uint64_t _pull_target;  // sender's current cwnd (0 = credits disabled)
+    uint64_t _pull_target;  // credit horizon advertised by sender
     static PacketDB<FastflowPacket> _packetdb;
 };
 

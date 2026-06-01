@@ -175,8 +175,11 @@ protected:
     uint64_t _blocked_rtx_dbg;
 
     // --- Idea 1: credits + MCC ---
-    uint64_t _initial_burst_remaining;  // 1 BDP blind send before credits
+    uint64_t _initial_burst_remaining;  // 1 MTU blind send to bootstrap the credit loop
     uint64_t _receiver_credits;         // bytes the sink has authorised
+    simtime_picosec _last_rts_time;     // rate-limits RTS to once per base_rtt
+    simtime_picosec _last_credit_time;  // timestamp of last pull credit received
+    simtime_picosec _credit_ema;        // EMA of credit interarrival time (proxy for N senders)
     simtime_picosec _msg_start_time;
     uint64_t _msg_acked;                // bytes acked since msg start
     double   _msg_target_bw;            // bytes/sec the message expects
@@ -214,7 +217,8 @@ private:
     bool send_next_packet();
     void retransmit_packet();
     void send_syn();
-    bool can_send_one_mtu() const;     // checks credits + cwnd
+    bool can_send_one_mtu() const;
+    void maybe_send_rts();             // credit-request when credit-blocked
 
     // --- Trim / timeout reaction (Algo 1 lines 28-34) ---
     void handle_trim(FastflowAck& ack);
@@ -321,7 +325,7 @@ protected:
 private:
     void send_ack(FastflowPacket& pkt, bool trimmed, simtime_picosec now);
     void update_recv_window(uint32_t pkt_size, simtime_picosec now);
-    void update_pull_target(uint64_t new_pt);  // updates _pull_target; resets epoch on decrease
+    void update_pull_target(uint64_t new_pt);  // unconditionally update (bidirectional)
 };
 
 // ===========================================================================

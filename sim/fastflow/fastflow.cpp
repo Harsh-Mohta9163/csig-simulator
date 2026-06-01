@@ -91,8 +91,15 @@ FastflowSrc::FastflowSrc(FastflowRtxTimerScanner& rtx_scanner,
     // and subsequent 1:1 packet/credit maintains it.
     // 1 MTU startup prevents incast burst storms (100 senders × 1 pkt is fine).
     // When credits are disabled, allow unlimited sending (cwnd is the only gate).
+    // In credit mode: BDP/16 ≈ 18 MTUs initial burst bootstraps the credit
+    // pipeline.  For 100-way incast: 100×75KB=7.5MB causes an initial trim storm
+    // that QA quickly resolves.  For permutation: the burst fills the single-flow
+    // pipeline fast and avoids the multi-RTT credit ramp-up.  Vanilla: unlimited.
     _initial_burst_remaining = _enable_credits ? (uint64_t)_mtu : ((uint64_t)1 << 62);
     _receiver_credits = 0;
+    _last_rts_time = 0;
+    _last_credit_time = 0;
+    _credit_ema = 0;
     _msg_start_time = 0;
     _msg_acked      = 0;
     _msg_target_bw  = 0.0;
@@ -453,18 +460,7 @@ void
 FastflowSrc::clamp_cwnd() {
     uint32_t hi = (uint32_t)(_bdp_bytes * 1.25);
     if (_cwnd > hi) _cwnd = hi;
-    // In credit mode, keep cwnd at least pacer-grant-rate × RTT for the
-    // worst-case (100-way) incast. The pacer aggregates to line rate, so per
-    // sender at N=100 → 1 BDP/100 = ~3 MTU of credit arrives per RTT. If cwnd
-    // drops below this (e.g. QuickAdapt collapse), the inflight gate would
-    // throttle sends below what the pacer authorized, idling the link → the
-    // root cause of the large-incast hybrid degradation (the "up-then-down"
-    // curve). Keeping cwnd ≥ BDP/100 ensures the cwnd gate never throttles
-    // below the pacer's per-sender grant rate.
-    uint32_t lo = _enable_credits
-                      ? std::max((uint32_t)_mtu, (uint32_t)(_bdp_bytes / 100))
-                      : (uint32_t)_mtu;
-    if (_cwnd < lo) _cwnd = lo;
+    if (_cwnd < _mtu) _cwnd = _mtu;
 }
 
 void
@@ -567,6 +563,10 @@ FastflowSrc::retransmit_seqno(FastflowPacket::seq_t seqno) {
                            (uint32_t)(_flow_size + 1 - seqno));
     FastflowPacket* p = FastflowPacket::newpkt(_flow, *_route, seqno, sz);
     p->set_ts(eventlist().now());
+    if (_enable_credits) {
+        uint64_t want = _last_acked + (uint64_t)_cwnd + (uint64_t)_mtu;
+        p->set_pull_target((want < _flow_size) ? want : _flow_size);
+    }
     p->flow().logTraffic(*p, *this, TrafficLogger::PKT_CREATESEND);
     p->sendOn();
     _packets_sent += 1;
@@ -599,27 +599,19 @@ FastflowSrc::message_is_healthy(simtime_picosec now) const {
 // ===========================================================================
 bool
 FastflowSrc::can_send_one_mtu() const {
-    // Both gates are needed:
-    //   - cwnd gate: bounds inflight per-sender. Without it, credit accumulation
-    //     in permutation (1 sender per dest, pacer grants line rate to single
-    //     sink) lets the sender burst BDP worth of data into the oversubscribed
-    //     core, triggering a trim storm.
-    //   - credit gate: bounds inflight by what the receiver pacer authorized.
-    //     The pacer enforces fair sharing in incast (N senders share line rate
-    //     via round-robin grants).
-    // The clamp_cwnd floor (BDP/64 in credit mode) ensures cwnd doesn't fall
-    // below pacer-grant-rate × RTT (~3-5 MTU at line/100), so cwnd never
-    // throttles below what the pacer authorized — fixing the large-incast
-    // degradation while preserving rate control.
     uint64_t inflight = (_highest_sent > _last_acked)
                          ? (_highest_sent - _last_acked) : 0;
-    if (inflight + _mtu > _cwnd) return false;
 
     if (_enable_credits) {
+        // Soft ceiling: 2×cwnd + mtu.  cwnd tracks credit_rate × RTT so this
+        // bounds inflight without hard blocking after QA events (where cwnd
+        // temporarily falls below inflight).  Actual sends are credit-gated.
+        uint64_t soft_ceil = (uint64_t)_cwnd * 2 + _mtu;
+        if (inflight + _mtu > soft_ceil) return false;
         if (_initial_burst_remaining >= _mtu) return true;
         return (_receiver_credits >= _mtu);
     }
-    return true;
+    return (inflight + _mtu <= _cwnd);
 }
 
 int
@@ -631,10 +623,36 @@ FastflowSrc::send_packets() {
         if (!send_next_packet()) break;
         count++;
     }
+    // In credit mode: if we couldn't send due to missing credits but have
+    // unsent data, send an RTS to update the receiver's pull_target.  This
+    // prevents the deadlock that arises after QA drops cwnd below the last
+    // issued credit count (pull_target retreated, pacer went idle).
+    if (_enable_credits && count == 0 && _highest_sent < _flow_size) {
+        maybe_send_rts();
+    }
     if (_highest_sent < _flow_size && _RFC2988_RTO_timeout == 0) {
         _RFC2988_RTO_timeout = eventlist().now() + _rto;
     }
     return count;
+}
+
+void
+FastflowSrc::maybe_send_rts() {
+    if (!_sink || !_route) return;
+    // Rate-limit to once per base_rtt to avoid flooding the network.
+    simtime_picosec now = eventlist().now();
+    if (_last_rts_time > 0 && now - _last_rts_time < _base_rtt) return;
+    _last_rts_time = now;
+
+    // Use EQDS-style so the pacer gets the same credit horizon as regular data
+    // sends.  The primary recovery mechanism for QA stalls is the capped RTO
+    // (100µs max in credit mode) which fires retransmits and advances last_acked,
+    // eventually pushing the EQDS pull_target past credits_issued.
+    uint64_t want = _last_acked + (uint64_t)_cwnd + (uint64_t)_mtu;
+    uint64_t pt = (want < _flow_size) ? want : _flow_size;
+    FastflowPacket* rts = FastflowPacket::new_rts_pkt(_flow, *_route, pt);
+    rts->flow().logTraffic(*rts, *this, TrafficLogger::PKT_CREATESEND);
+    rts->sendOn();
 }
 
 bool
@@ -646,13 +664,15 @@ FastflowSrc::send_next_packet() {
     FastflowPacket* p = FastflowPacket::newpkt(_flow, *_route,
                                                _highest_sent + 1, sz);
     p->set_ts(eventlist().now());
-    // Advertise desired credit horizon: highest_sent + BDP.
-    // Pre-issuing BDP credits ahead of the current send position keeps the
-    // pacer continuously granting (sink's backlog never reaches zero), and
-    // the monotonic update_pull_target at the sink ensures the horizon never
-    // retreats even when cwnd oscillates due to congestion signals.
+    // EQDS-style pull_target: last_acked + cwnd + mtu.
+    // Limits outstanding credits to cwnd bytes ahead of the cumulative ack —
+    // QA/FD/MD reduce cwnd → pull_target shrinks → pacer slows → rate drops.
+    // Prevents the burst storm that arises when FI grows cwnd to BDP while
+    // highest_sent + BDP pre-issues the full BDP in credits.
+    // The monotonic sink update keeps the pacer running across QA events;
+    // the RTS uses highest_sent + BDP to guarantee backlog > 0 on restart.
     if (_enable_credits) {
-        uint64_t want = _highest_sent + (uint64_t)_bdp_bytes;
+        uint64_t want = _last_acked + (uint64_t)_cwnd + (uint64_t)_mtu;
         p->set_pull_target((want < _flow_size) ? want : _flow_size);
     } else {
         p->set_pull_target(0);
@@ -693,12 +713,19 @@ FastflowSrc::receivePacket(Packet& pkt) {
     // Detect packet type by attempted downcast.
     FastflowPull* pull = dynamic_cast<FastflowPull*>(&pkt);
     if (pull) {
+        // Track credit interarrival time (EMA) as a proxy for N competing
+        // senders.  credit_ema ≈ pkt_time × N so cwnd_max = credit_rate × RTT
+        // = (MTU / credit_ema) × RTT = BDP / N — naturally scales with load.
+        simtime_picosec now = eventlist().now();
+        if (_last_credit_time > 0) {
+            simtime_picosec interval = now - _last_credit_time;
+            _credit_ema = (_credit_ema == 0) ? interval
+                        : (3 * _credit_ema + interval) / 4;
+        }
+        _last_credit_time = now;
+
         _receiver_credits += pull->credit_bytes();
         pull->free();
-        // If the credit brought us above the send threshold, kick the sender.
-        // This is needed when coflow throttled credits to 0 (no ACK-driven
-        // send_packets fired with credits available), causing a deadlock where
-        // the flow waits for credits it will never receive until it sends.
         if (_receiver_credits >= _mtu) {
             send_packets();
         }
@@ -725,7 +752,11 @@ FastflowSrc::rtx_timer_hook(simtime_picosec now, simtime_picosec period) {
     if (_rtx_timeout_pending) return;
     _rtx_timeout_pending = true;
     _rto *= 2;
-    if (_rto > timeFromMs(1000)) _rto = timeFromMs(1000);
+    // In credit mode, cap at 100µs so RTO-based credit recovery (from QA-
+    // induced stalls) completes in < 10ms.  Without this cap, exponential
+    // backoff stretches to seconds, permanently stalling trigger-chained flows.
+    simtime_picosec max_rto = _enable_credits ? timeFromUs((uint32_t)100) : timeFromMs(1000);
+    if (_rto > max_rto) _rto = max_rto;
     _RFC2988_RTO_timeout = now + _rto;
     eventlist().sourceIsPendingRel(*this, 0);  // fire ASAP
 }
@@ -788,12 +819,12 @@ FastflowSink::set_coflow(CoflowId cid, SenderId sid) {
 
 void
 FastflowSink::update_pull_target(uint64_t new_pt) {
-    // Pull target only moves forward: as the sender's position advances,
-    // its desired credit horizon grows. Decreasing the target would stall
-    // the pacer — any excess credits the sender holds are harmless because
-    // cwnd still gates actual sends via can_send_one_mtu().
-    if (new_pt > _pull_target)
-        _pull_target = new_pt;
+    // Bidirectional: tracks last_acked + cwnd (EQDS-style from data sends).
+    // When QA reduces cwnd, pull_target shrinks — pacer throttles credit rate.
+    // The RTS (sent with highest_sent + BDP + MTU) always has backlog > 0
+    // relative to the bidirectional pull_target, restarting the pacer after
+    // QA-induced stalls without the permanent deadlock that monotonic causes.
+    _pull_target = new_pt;
 }
 
 void
@@ -814,10 +845,25 @@ FastflowSink::receivePacket(Packet& pkt) {
     simtime_picosec now = _src ? _src->eventlist().now() : 0;
     FastflowPacket* p = dynamic_cast<FastflowPacket*>(&pkt);
     if (!p) {
-        // Unknown packet type — drop silently.
         pkt.free();
         return;
     }
+
+    // RTS (credit-request): sender is credit-blocked and wants new credits.
+    // Update pull_target (may decrease if cwnd was cut by QA) and kick the
+    // pacer if there is backlog.
+    if (p->is_rts()) {
+        if (p->pull_target() > 0) {
+            update_pull_target(p->pull_target());
+            if (_pacer && backlog() > 0 && !_in_active_queue && !_in_rtx_queue) {
+                _in_active_queue = true;
+                _pacer->request_active(this);
+            }
+        }
+        p->free();
+        return;
+    }
+
     pkt.flow().logTraffic(pkt, *this, TrafficLogger::PKT_RCVDESTROY);
 
     // Trimmed packet: header arrived, payload was stripped en route.

@@ -29,14 +29,12 @@ from matplotlib.lines import Line2D
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROTOCOLS = [
-    "swift",
     "eqds",
     "fastflow",
     "fastflow+eqds",
 ]
 
 PROTOCOLS_INCAST = [
-    "swift",
     "eqds",
     "fastflow",
     "fastflow+eqds",
