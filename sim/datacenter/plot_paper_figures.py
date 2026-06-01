@@ -421,8 +421,9 @@ def plot_fig9_alltoall(results_dir, plots_dir):
     os.makedirs(f"{plots_dir}/alltoall", exist_ok=True)
 
     ks = [1, 2, 8, 16]
-    # alltoall only compares FASTFLOW variants + Swift (no EQDS alltoall data)
-    PROTOCOLS_A2A = ["swift", "fastflow", "fastflow+eqds", "fastflow+eqds+mcc+coflow"]
+    # Paper Fig 14 compares EQDS vs sender-based mechanisms; we use the same
+    # three protocols as the rest of the figures so the conclusion is consistent.
+    PROTOCOLS_A2A = ["eqds", "fastflow", "fastflow+eqds"]
 
     # Theoretical ideal JCT:
     # 127 flows × 1MiB per sender; 8:1 OS → effective uplink = 800Gbps/8 = 100 Gbps
@@ -431,18 +432,24 @@ def plot_fig9_alltoall(results_dir, plots_dir):
     # = 127 × 1MiB × 8 bits/byte × 8 OS / LINKSPEED_BPS × 1e3 ms/s
     ideal_ms_os8 = 127 * 1048576 * 8 * 8 / LINKSPEED_BPS * 1e3  # ≈ 10.65 ms
 
-    # Compute JCT for each protocol × k
-    jct = {}  # (proto, k) -> ms
+    # Compute JCT for each protocol × k.
+    # Note: EQDS often runs partial completion (40-90%) in heavy alltoall
+    # because it stalls under oversubscription. We accept ≥30% completion
+    # and label the bar with completion% so the comparison is transparent.
+    jct = {}      # (proto, k) -> ms
+    completion = {}  # (proto, k) -> fraction
+    EXPECTED_FLOWS = 16256
     for proto in PROTOCOLS_A2A:
         for k in ks:
             path = os.path.join(results_dir, "alltoall", PROTO_DIRS[proto],
                                 f"a2a_128n_k{k}.fct")
             starts, finishes, fcts = load_timestamps(path)
-            if starts and len(starts) >= 16256 * 0.90:
-                # Accept ≥ 90% completion; JCT = last finish - first start
-                jct[(proto, k)] = (max(finishes) - min(starts)) / 1000  # ms
+            if starts and len(starts) >= EXPECTED_FLOWS * 0.30:
+                jct[(proto, k)] = (max(finishes) - min(starts)) / 1000
+                completion[(proto, k)] = len(starts) / EXPECTED_FLOWS
             else:
                 jct[(proto, k)] = None
+                completion[(proto, k)] = 0
 
     fig, ax = plt.subplots(figsize=(9, 4.5))
 
@@ -457,14 +464,21 @@ def plot_fig9_alltoall(results_dir, plots_dir):
             val = jct.get((proto, k))
             if val is None:
                 continue
+            comp = completion.get((proto, k), 1.0)
             ax.bar(x[k_idx] + offsets[p_idx], val, bar_w,
                    color=PROTO_COLORS[proto],
                    label=PROTO_LABELS[proto] if k_idx == 0 else "",
+                   alpha=0.45 if comp < 0.95 else 1.0,   # fade incomplete bars
+                   hatch='///' if comp < 0.95 else None,
                    zorder=3)
-            # % above ideal label
+            # % above ideal label, plus completion % if partial
             pct = (val - ideal_ms_os8) / ideal_ms_os8 * 100
+            if comp < 0.95:
+                txt = f"{pct:.0f}%\n({100*comp:.0f}% done)"
+            else:
+                txt = f"{pct:.0f}%"
             ax.text(x[k_idx] + offsets[p_idx], val + 0.15,
-                    f"{pct:.0f}%", ha="center", va="bottom",
+                    txt, ha="center", va="bottom",
                     fontsize=6.5, fontweight="bold")
 
     # Ideal line
@@ -564,6 +578,9 @@ def main():
 
     print("\nFig 8: Permutation CDF (bisect scenarios)")
     plot_fig8_permutation(args.results_dir, args.plots_dir)
+
+    print("\nFig 9: Alltoall (k=1,2,8,16)")
+    plot_fig9_alltoall(args.results_dir, args.plots_dir)
 
     print("\nFig 10: FASTFLOW+EQDS permutation")
     plot_fig10_eqds_fastflow(args.results_dir, args.plots_dir)
