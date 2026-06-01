@@ -104,6 +104,7 @@ public:
     static bool _enable_mcc;       // Idea 1: message-level CC override
     static bool _trim_supported;   // if false, rely on timeouts instead of trimming
     static bool _blast_start;      // start cwnd at BDP and let trimming settle it
+    static bool _reps_enabled;     // REPS multipath spraying (paper §III-A); else single-path PLB
 
     // For workload-aware MCC: target bandwidth per flow (bytes/sec)
     void set_msg_target_bw(double bytes_per_sec) { _msg_target_bw = bytes_per_sec; }
@@ -139,7 +140,6 @@ protected:
     // bounded to keep buffer cost reasonable.
     // _reps_routes mirrors _paths but with the sink appended so packets are
     // delivered (matches what connect() does for _route).
-    static bool _reps_enabled;
     std::vector<Route*> _reps_routes;
     std::deque<uint32_t> _clean_entropies;
     static constexpr size_t _clean_entropy_cap = 64;

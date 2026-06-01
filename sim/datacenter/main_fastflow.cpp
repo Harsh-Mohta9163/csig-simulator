@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     bool use_credits = false;
     bool use_mcc = false;
     bool use_coflow = false;
+    double fi_scale = 1.0;
 
     double msg_target_bw = 0.0;
     double msg_tolerance = 0.85;
@@ -103,6 +104,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-plb"))         { plb = flag_on(argv[++i]); }
         else if (!strcmp(argv[i], "-ra_qa"))       { ra_qa = flag_on(argv[++i]); }
         else if (!strcmp(argv[i], "-blast_start")) { blast_start = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-reps"))        { FastflowSrc::_reps_enabled = flag_on(argv[++i]); }
+        else if (!strcmp(argv[i], "-fi_scale"))    { fi_scale = atof(argv[++i]); }
         else if (!strcmp(argv[i], "-mode")) {
             const char* m = argv[++i];
             if (!strcmp(m, "fastflow")) {
@@ -197,7 +200,9 @@ int main(int argc, char** argv) {
     FastflowSrc::_target_rtt = trtt;
     FastflowSrc::_bdp_bytes  = (uint32_t)bdp_bytes;
     // fi scaled by gamma = bdp/reference_bdp so ramp-up time is topology-invariant.
-    FastflowSrc::_fi_const   = 0.25 * gamma;
+    // fi_scale CLI flag allows experimenting with stronger Fair Increase bias
+    // for incast fairness (paper §III-I.3).
+    FastflowSrc::_fi_const   = 0.25 * gamma * fi_scale;
     // pi constant is brtt/(trtt-brtt), computed per-call inside proportional_increase.
     FastflowSrc::_k_fastinc  = 2;
 
