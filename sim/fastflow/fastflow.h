@@ -164,6 +164,11 @@ protected:
     // --- RTT/RTO ---
     simtime_picosec _rtt, _rto, _mdev;
     simtime_picosec _min_rto;
+    // Per-flow base_RTT measurement (paper §III-I.3 "scale fi based on BDP of the path").
+    // _measured_brtt tracks the minimum observed RTT for this flow and is used to
+    // recompute a flow-local fi_const so intra-vs-inter-rack flows share fairly.
+    simtime_picosec _measured_brtt;
+    double          _flow_fi_const;
     simtime_picosec _RFC2988_RTO_timeout;
     bool _rtx_timeout_pending;
     uint32_t _retransmit_cnt;

@@ -69,6 +69,8 @@ FastflowSrc::FastflowSrc(FastflowRtxTimerScanner& rtx_scanner,
     _rtt           = 0;
     _rto           = timeFromUs((uint32_t)200);
     _mdev          = 0;
+    _measured_brtt = 0;
+    _flow_fi_const = _fi_const;   // start with global default; refined per-flow on first RTT
     // Lower bound on RTO. We use 25us because base RTT at 800Gbps fat-tree
     // is ~12us — a hole stuck because its trim ACK was dropped should be
     // retried after ~2 RTTs, not 100us+.
@@ -428,9 +430,10 @@ FastflowSrc::multiplicative_decrease() {
 
 // Paper Eq.3 — Fair Increase.
 // cwnd += (pkt_size / cwnd) × mtu × fi
+// fi is per-flow (scaled by measured base_RTT) per paper §III-I.3.
 void
 FastflowSrc::fair_increase(uint16_t pkt_size) {
-    double inc = ((double)pkt_size / (double)_cwnd) * (double)_mtu * _fi_const;
+    double inc = ((double)pkt_size / (double)_cwnd) * (double)_mtu * _flow_fi_const;
     _cwnd += (uint32_t)inc;
 }
 
@@ -460,6 +463,18 @@ FastflowSrc::clamp_cwnd() {
 void
 FastflowSrc::update_rtt(simtime_picosec sample) {
     if (sample == 0) return;
+    // Track per-flow base_RTT and recompute fi_const so flows with shorter
+    // paths use a smaller fi (paper §III-I.3) — gives a fairness bias when
+    // some flows are intra-rack and others cross the core.
+    if (_measured_brtt == 0 || sample < _measured_brtt) {
+        _measured_brtt = sample;
+        // fi scales with this flow's BDP; reference is 100Gbps × 12µs / 8 = 150KB.
+        double flow_bdp = ((double)_bdp_bytes / (double)_base_rtt) * (double)_measured_brtt;
+        double reference_bdp = 150000.0;
+        double flow_gamma = flow_bdp / reference_bdp;
+        if (flow_gamma < 0.1) flow_gamma = 0.1;
+        _flow_fi_const = 0.25 * flow_gamma;
+    }
     if (_rtt == 0) {
         _rtt  = sample;
         _mdev = sample / 2;
@@ -663,13 +678,13 @@ FastflowSrc::maybe_send_rts() {
 // Capacity-bounded deque acts as the "recycled" cache.
 uint32_t
 FastflowSrc::select_entropy() {
-    if (!_reps_enabled || _paths.empty()) return 0;
+    if (!_reps_enabled || _reps_routes.empty()) return 0;
     if (!_clean_entropies.empty()) {
         uint32_t e = _clean_entropies.front();
         _clean_entropies.pop_front();
         return e;
     }
-    return (uint32_t)(random() % _paths.size());
+    return (uint32_t)(random() % _reps_routes.size());
 }
 
 bool

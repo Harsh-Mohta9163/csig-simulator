@@ -30,6 +30,7 @@
 #include "loggers.h"
 #include "clock.h"
 #include "compositequeue.h"
+#include "ecn.h"
 #include "topology.h"
 #include "connection_matrix.h"
 #include "fat_tree_topology.h"
@@ -177,6 +178,27 @@ int main(int argc, char** argv) {
     }
     no_of_nodes = top->no_of_nodes();
     cout << "[fastflow] actual nodes " << no_of_nodes << endl;
+
+    // Paper §III-J: set RED ECN thresholds K_min=20%, K_max=80% on all
+    // CompositeQueues across the topology.  Default htsim COMPOSITE queue has
+    // _ecn_minthresh = maxsize*2 (effectively disabled), meaning FASTFLOW
+    // would only see trims and never ECN — destroying the §III-I MD path.
+    mem_b qsize_bytes = queuesize;  // queuesize already in bytes after init
+    mem_b kmin = (mem_b)(qsize_bytes * 0.20);
+    mem_b kmax = (mem_b)(qsize_bytes * 0.80);
+    auto set_ecn_on = [&](std::vector<std::vector<std::vector<BaseQueue*>>>& qs) {
+        for (auto& v1 : qs)
+            for (auto& v2 : v1)
+                for (auto* q : v2)
+                    if (auto* cq = dynamic_cast<CompositeQueue*>(q))
+                        cq->set_ecn_thresholds(kmin, kmax);
+    };
+    set_ecn_on(top->queues_nlp_ns);   // ToR ↔ host
+    set_ecn_on(top->queues_ns_nlp);
+    set_ecn_on(top->queues_nlp_nup);  // ToR ↔ Agg
+    set_ecn_on(top->queues_nup_nlp);
+    set_ecn_on(top->queues_nup_nc);   // Agg ↔ Core
+    cout << "[fastflow] ECN thresholds: K_min=" << kmin << "B  K_max=" << kmax << "B" << endl;
 
     // ----- Derive FASTFLOW parameters from the topology -----------------
     //
