@@ -19,12 +19,7 @@
 // unit tests that don't initialise the topology first.
 
 uint16_t FastflowSrc::_mtu          = 4000;
-double   FastflowSrc::_fd_const     = 0.8;
 double   FastflowSrc::_fi_const     = 0.25;
-double   FastflowSrc::_md_const     = 2.0;
-double   FastflowSrc::_qa_scaling   = 0.8;
-double   FastflowSrc::_wtd_alpha    = 0.125;
-double   FastflowSrc::_wtd_thresh   = 0.25;
 uint32_t FastflowSrc::_k_fastinc    = 2;
 simtime_picosec FastflowSrc::_base_rtt   = timeFromUs((uint32_t)12);
 simtime_picosec FastflowSrc::_target_rtt = timeFromUs((uint32_t)18);
@@ -65,7 +60,6 @@ FastflowSrc::FastflowSrc(FastflowRtxTimerScanner& rtx_scanner,
     _bytes_ignored = 0;
     _bytes_to_ignore = 0;
     _trigger_qa    = false;
-    _avg_wtd       = 0.0;
     _fast_inc_count = 0;
     _in_fast_inc   = false;
     _qa_end        = 0;
@@ -231,7 +225,11 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
                              ? (ack.ackno() - _last_acked)
                              : 0;
     _acked         += new_bytes;
-    _bytes_ignored += new_bytes;
+    // Paper Alg.4 line 3: bytes_ignored += p.size for EVERY packet (ACK or trim).
+    // Using MTU so trim ACKs (which don't advance cum-ack, giving new_bytes=0) also
+    // drain the ignore window. Without this, heavy trim storms stall the ignore window
+    // indefinitely because new_bytes=0 for each trim and bytes_ignored never grows.
+    _bytes_ignored += (uint64_t)_mtu;
     _msg_acked     += new_bytes;
     if (ack.ackno() > _last_acked) {
         _last_acked = ack.ackno();
@@ -259,7 +257,8 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
     simtime_picosec rtt_sample = now - ack.ts_echo();
     update_rtt(rtt_sample);
 
-    // PLB: switch ECMP path on persistent congestion (paper: multi-pathing for all)
+    // PLB / LOAD_BALANCER_PATH_CHANGE (paper Alg.1 ecn&&rtt<trtt case):
+    // switch ECMP path when ECN marks arrive but delay is still below target.
     bool ecn_for_plb = ack.ecn_echo();
     if (_plb && !_paths.empty() && _rtt > 0) {
         if (rtt_sample <= _target_rtt && !ecn_for_plb) {
@@ -276,19 +275,18 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
         }
     }
 
-    // Post-QuickAdapt ignore window: we already shrank cwnd, so suppress
-    // *further decreases* until the in-flight stale signals drain. We
-    // explicitly do NOT short-circuit out of the handler — fair_increase
-    // and multiplicative_increase still get to grow cwnd during recovery,
-    // which is essential for incast where cwnd ends up at 1 MTU after QA
-    // and would otherwise stay there for the whole flow.
-    bool in_ignore_window = (_bytes_ignored < _bytes_to_ignore);
+    // Paper Alg.4 lines 6-8: ignore-window early return.
+    // After QuickAdapt fires it sets bytes_to_ignore = unacked; all subsequent
+    // ACKs are skipped entirely until those in-flight stale signals drain.
+    // This blocks QA, FastIncrease, AND core_cases — matching Algorithm 4.
+    if (_bytes_ignored < _bytes_to_ignore) {
+        send_packets();
+        maybe_report_completion();
+        return;
+    }
 
-    bool ecn = ack.ecn_echo();
-    bool can_dec = wait_to_decrease(ecn, now);
-
-    // QuickAdapt fires *only* if a trim/timeout previously armed it.
-    // fast_increase fires only when we've had >cwnd subsequent clean bytes.
+    // Paper Alg.4 lines 9-13: QuickAdapt then FastIncrease.
+    // Either short-circuits the rest of the loop.
     bool adp = quick_adapt(ack, now);
     bool finc = fast_increase(ack);
     if (adp || finc) {
@@ -298,28 +296,32 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
         return;
     }
 
-    // Four-case logic
+    // Paper Alg.4 line 14: core_cases (Algorithm 1).
     simtime_picosec trtt = _target_rtt;
+    bool ecn = ack.ecn_echo();
     bool healthy = _enable_mcc && message_is_healthy(now);
     uint16_t sz = (new_bytes > 0) ? (uint16_t)std::min((uint64_t)_mtu, new_bytes) : _mtu;
 
-    if (ecn && rtt_sample <= trtt && can_dec) {
-        if (!healthy && !in_ignore_window) fair_decrease(sz);
-    }
-    else if (ecn && rtt_sample > trtt && can_dec) {
-        if (!healthy && !in_ignore_window) {
-            multiplicative_decrease(sz, rtt_sample);
-            fair_decrease(sz);  // paper: MD additionally applies FD
+    if (ecn && rtt_sample > trtt) {
+        // §III-I.2 Multiplicative Decrease — once per base RTT.
+        if (!healthy && (now - _last_decrease) >= _base_rtt) {
+            multiplicative_decrease();
         }
     }
+    else if (ecn && rtt_sample < trtt) {
+        // §III-I.1 Load Balancer Path Change + NO_OP_CC.
+        // PLB block above already handles the path change; cwnd is not altered.
+    }
     else if (!ecn && rtt_sample > trtt) {
-        // MCC overrides only suppress decreases; increases are always normal.
+        // §III-I.3 Fair Increase.
         fair_increase(sz);
     }
-    else { // !ecn && rtt <= trtt
-        multiplicative_increase(sz, rtt_sample);
-        fair_increase(sz);  // paper: MI additionally applies FI
+    else if (!ecn && rtt_sample < trtt) {
+        // §III-I.4 Proportional Increase (followed by Fair Increase per §III-I.4).
+        proportional_increase(sz, rtt_sample);
+        fair_increase(sz);
     }
+    // rtt_sample == trtt: no action (paper uses strict < and >).
 
     clamp_cwnd();
     send_packets();
@@ -327,16 +329,6 @@ FastflowSrc::handle_ack(FastflowAck& ack) {
 }
 
 // ---------- Sub-procedures --------------------------------------------------
-
-bool
-FastflowSrc::wait_to_decrease(bool ecn, simtime_picosec now) {
-    // EMA of ECN markings (paper Sec 3.5.1)
-    _avg_wtd = _wtd_alpha * (ecn ? 1.0 : 0.0) + (1.0 - _wtd_alpha) * _avg_wtd;
-    if (_avg_wtd < _wtd_thresh) return false;
-    // Also enforce once-per-RTT
-    if (_rtt > 0 && (now - _last_decrease) < _rtt) return false;
-    return true;
-}
 
 bool
 FastflowSrc::quick_adapt(FastflowAck& ack, simtime_picosec now) {
@@ -350,13 +342,14 @@ FastflowSrc::quick_adapt(FastflowAck& ack, simtime_picosec now) {
         _trigger_qa = false;
         adapted = true;
 
-        // Idea 3 (RA-QA): use receiver-stamped bytes if available.
+        // Paper Alg.2 line 7: cwnd = max(acked, mtu). No scaling constant —
+        // the paper §III-E says qa_scaling = 1. RA-QA (Idea 3) substitutes
+        // receiver-measured bytes when available.
         uint64_t basis = _acked;
         if (_enable_ra_qa && ack.recv_bytes_trtt() > 0) {
             basis = ack.recv_bytes_trtt();
         }
-        uint64_t new_cwnd = (uint64_t)((double)std::max(basis, (uint64_t)_mtu) * _qa_scaling);
-        _cwnd = (uint32_t)std::max(new_cwnd, (uint64_t)_mtu);
+        _cwnd = (uint32_t)std::max(basis, (uint64_t)_mtu);
 
         // grace window — ignore stale congestion signals from in-flight pkts
         uint64_t unacked = (_highest_sent > _last_acked)
@@ -373,25 +366,11 @@ FastflowSrc::quick_adapt(FastflowAck& ack, simtime_picosec now) {
 
 bool
 FastflowSrc::fast_increase(FastflowAck& ack) {
-    // Algorithm 3.
-    // The gate strictness depends on the mode:
-    //   - Vanilla FASTFLOW (no credits): strict gate (rtt ≤ base + quarter).
-    //     cwnd is the only brake on inflight, so a looser gate causes the
-    //     classic 100-way-incast trim storm.
-    //   - FASTFLOW+EQDS (credits on): relaxed gate (rtt < target_rtt). cwnd
-    //     here drives pull_target (the credit horizon); actual sends are
-    //     credit-gated by the pacer at line rate. Relaxing FI lets cwnd ramp
-    //     fast enough to keep pull_target ahead of credits_issued so the
-    //     sink/pacer never go idle — matching EQDS's cwnd→pull_target loop.
+    // Paper Algorithm 3: triggered when rtt ≈ base_rtt (no ECN).
+    // Gate: rtt <= base_rtt — strictly matches §III-F "RTT close to base RTT".
     bool clean = !ack.ecn_echo();
     simtime_picosec rtt = _rtt;
-    bool rtt_near_base;
-    if (_enable_credits) {
-        rtt_near_base = (rtt == 0) || (rtt < _target_rtt);
-    } else {
-        rtt_near_base = (rtt == 0) ||
-                        (rtt <= _base_rtt + (_target_rtt - _base_rtt) / 4);
-    }
+    bool rtt_near_base = (rtt == 0) || (rtt <= _base_rtt);
 
     if (clean && rtt_near_base) {
         uint64_t new_bytes = (ack.ackno() > _last_acked)
@@ -409,48 +388,39 @@ FastflowSrc::fast_increase(FastflowAck& ack) {
     return false;
 }
 
-// Eq. 1
+// Paper Eq.1 — Multiplicative Decrease.
+// cwnd = cwnd × max(0.5,  1 − (avg_rtt − trtt)/avg_rtt × 0.8)
+// Uses _rtt (EWMA of RTT samples, equivalent to paper's avg_rtt).
+// Called at most once per base_rtt (enforced by caller).
 void
-FastflowSrc::fair_decrease(uint16_t pkt_size) {
-    double d = ((double)_cwnd / (double)_bdp_bytes) * _fd_const * (double)pkt_size;
-    if ((uint32_t)d >= _cwnd) {
-        _cwnd = _mtu;
-    } else {
-        _cwnd -= (uint32_t)d;
-    }
+FastflowSrc::multiplicative_decrease() {
+    if (_rtt <= _target_rtt) return;   // guard: only when rtt > trtt
+    double ratio  = (double)(_rtt - _target_rtt) / (double)_rtt;
+    double factor = 1.0 - ratio * 0.8;
+    if (factor < 0.5) factor = 0.5;   // cap: never halve more than once
+    uint64_t new_cwnd = (uint64_t)((double)_cwnd * factor);
+    _cwnd = (uint32_t)std::max(new_cwnd, (uint64_t)_mtu);
     _last_decrease = eventlist().now();
 }
 
-// Eq. 2
-void
-FastflowSrc::multiplicative_decrease(uint16_t pkt_size, simtime_picosec rtt_sample) {
-    double ratio = (double)(rtt_sample - _target_rtt) / (double)rtt_sample;
-    double dec = ratio * _md_const * (double)pkt_size;
-    if (dec > (double)pkt_size) dec = (double)pkt_size;
-    if ((uint32_t)dec >= _cwnd) {
-        _cwnd = _mtu;
-    } else {
-        _cwnd -= (uint32_t)dec;
-    }
-    _last_decrease = eventlist().now();
-}
-
-// Eq. 3
+// Paper Eq.3 — Fair Increase.
+// cwnd += (pkt_size / cwnd) × mtu × fi
 void
 FastflowSrc::fair_increase(uint16_t pkt_size) {
     double inc = ((double)pkt_size / (double)_cwnd) * (double)_mtu * _fi_const;
     _cwnd += (uint32_t)inc;
 }
 
-// Eq. 4
+// Paper Eq.4 — Proportional Increase (PI, followed by FI per §III-I.4).
+// cwnd += min(size, (trtt − rtt)/rtt × pkt_size/cwnd × mtu × pi)
+// pi = brtt / (trtt − brtt)
 void
-FastflowSrc::multiplicative_increase(uint16_t pkt_size, simtime_picosec rtt_sample) {
-    // mi = brtt / (trtt - brtt), bounded
+FastflowSrc::proportional_increase(uint16_t pkt_size, simtime_picosec rtt_sample) {
     if (_target_rtt <= _base_rtt) return;
-    double mi = (double)_base_rtt / (double)(_target_rtt - _base_rtt);
+    double pi  = (double)_base_rtt / (double)(_target_rtt - _base_rtt);
     double inc = ((double)(_target_rtt - rtt_sample) / (double)rtt_sample)
                  * (double)pkt_size / (double)_cwnd
-                 * (double)_mtu * mi;
+                 * (double)_mtu * pi;
     if (inc > (double)pkt_size) inc = (double)pkt_size;
     if (inc < 0) inc = 0;
     _cwnd += (uint32_t)inc;
@@ -458,8 +428,9 @@ FastflowSrc::multiplicative_increase(uint16_t pkt_size, simtime_picosec rtt_samp
 
 void
 FastflowSrc::clamp_cwnd() {
-    uint32_t hi = (uint32_t)(_bdp_bytes * 1.25);
-    if (_cwnd > hi) _cwnd = hi;
+    // §III-J: maximum window = 1.5 × BDP; minimum = 1 MTU.
+    uint32_t hi = (uint32_t)(_bdp_bytes * 1.5);
+    if (_cwnd > hi)  _cwnd = hi;
     if (_cwnd < _mtu) _cwnd = _mtu;
 }
 

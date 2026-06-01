@@ -102,7 +102,7 @@ export FF_BIN SW_BIN EQ_BIN TOPO_NB RESULTS
 echo "=== Fig 5: Incast (non-blocking, 800Gbps) ==="
 INCAST_CMDS=()
 for proto in swift eqds fastflow "fastflow+eqds"; do
-    for deg in 8 32 100; do
+    for deg in 8 32 50; do
         for siz in 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768; do
             INCAST_CMDS+=("$proto $deg $siz")
         done

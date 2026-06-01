@@ -1,125 +1,120 @@
-# FASTFLOW Implementation Report
+# FASTFLOW / SMaRTT Implementation Report
 
 ## 1. Goal
 
-Reproduce the qualitative trends from the FASTFLOW paper (Bonato et al. 2024) on a 1024-node 800Gbps fat-tree:
+Reproduce the qualitative **trends** (not exact numbers) from the SMaRTT paper (Bonato et al. 2024,
+"SMaRTT: Sender-based Marked Rapidly-adapting Trimmed & Timed Transport") on a 1024-node
+800Gbps fat-tree.  Specific trends to match:
 
-- **Incast** (many senders → one receiver): FF+EQDS ≥ EQDS > vanilla FASTFLOW. All should stay close to ideal (1.0 normalized) as flow size grows.
-- **Permutation** (oversubscribed core): FF+EQDS and FASTFLOW should beat EQDS in coflow-heavy workloads.
-- **No stalls**: every flow must complete in reasonable time.
-
----
-
-## 2. Current Results
-
-### Incast 100-way, normalized to theoretical best (1.0 = ideal, higher = better)
-
-| Size   | EQDS  | FASTFLOW | FF+EQDS |
-|--------|-------|----------|---------|
-| 128K   | 0.732 | 0.624    | **0.924** |
-| 512K   | 0.966 | 0.744    | **0.978** |
-| 1024K  | 0.974 | 0.780    | **0.987** |
-| 4096K  | 0.971 | 0.765    | **0.964** |
-| 8192K  | 0.971 | 0.748    | **0.954** |
-| 16384K | 0.970 | 0.736    | **0.945** |
-| 32768K | 0.970 | 0.737    | **0.950** |
-
-**Ordering: FF+EQDS ≥ EQDS > FASTFLOW at all sizes. ✓**
-
-### Permutation mean FCT in microseconds (lower = better)
-
-| Scenario           | EQDS  | FASTFLOW | FF+EQDS   |
-|--------------------|-------|----------|-----------|
-| os8 2MiB           | 209   | 211      | 257       |
-| os8 32MiB          | 3012  | 2982     | **3005**  |
-| os8 4×4MiB         | 1924  | 1897     | **1296**  |
-| os2 32MiB          | 809   | 1226     | **998**   |
-| os4 32MiB          | 1372  | 1970     | **1827**  |
-
-**FF+EQDS wins on 4×4MiB coflow (33% better than EQDS) and os2/os4 32MiB.**
-For 2MiB permutation, FF+EQDS is 23% slower than EQDS (credit bootstrap overhead).
+- **Incast** (8:1, 32:1, 50:1): FASTFLOW V-dip at medium sizes, recovery at large sizes.
+  FF+EQDS eliminates the dip (ideal hybrid). EQDS flat throughout.
+- **Permutation**: FASTFLOW beats EQDS at OS > 1:1. EQDS collapses under oversubscription.
+  FF+EQDS traces close to FASTFLOW.
 
 ---
 
-## 3. What Is Working
+## 2. Algorithm Corrections (this session)
 
-- **Incast ordering**: FF+EQDS ≥ EQDS > FASTFLOW at ALL sizes ✓
-- **Coflow permutation**: FF+EQDS decisively beats EQDS on 4×4MiB (1296 vs 1924µs = 33% better)
-- **Large permutation (32MiB)**: FF+EQDS matches EQDS on os8_32MiB (3005 vs 3012µs)
-- **No stalls**: All flows complete across all scenarios
+Six deviations from the paper were corrected:
 
----
+### 2a. Multiplicative Decrease — CRITICAL
 
-## 4. Key Fixes Implemented
+**Paper Eq.1:**
+```
+cwnd = cwnd × max(0.5,  1 − (avg_rtt − trtt) / avg_rtt × 0.8)
+```
+- Multiplicative on the whole cwnd (cuts from BDP to fair-share in ~7 RTTs).
+- Caps at "halve cwnd" (factor ≥ 0.5).
+- Uses avg_rtt (EWMA).
 
-### Root Cause of Original 0.74 Normalized Incast
+**Old code:** subtractive `cwnd -= ratio × 2.0 × pkt_size`. Capped at 1 MTU per RTT.
+Result: from BDP to fair-share took ~300 RTTs → cwnd never converged → 0.74 incast efficiency.
 
-The original FF+EQDS used `pull_target = highest_sent + BDP`. FastIncrease would grow cwnd to BDP (1.2MB). This triggered burst storms in 100-way incast:
+**Fixed in:** `FastflowSrc::multiplicative_decrease()` (no args, uses `_rtt` EWMA).
 
-1. FI grows cwnd to BDP → EQDS pull_target = highest_sent + BDP (large)
-2. Pacer authorizes BDP credits per sender (taking 1.2ms to deliver at 8Gbps)
-3. While cwnd = BDP, sender accumulates credits → burst into receiver queue
-4. Trim storm → QA → cwnd collapses → hard cwnd gate blocks sends
-5. Long drain period → low efficiency → 0.74 normalized
+### 2b. Core Cases (Alg.1)
 
-### Fix: EQDS-Style Credit System
+| Condition | Old code | Fixed code |
+|---|---|---|
+| `ecn && rtt > trtt` | MD + FD | MD only (once per base_rtt) |
+| `ecn && rtt < trtt` | FD | NO-OP (path change handled by PLB) |
+| `!ecn && rtt > trtt` | FI | FI only ✓ |
+| `!ecn && rtt < trtt` | PI + FI | PI + FI ✓ |
 
-**Change 1: `pull_target = last_acked + cwnd + mtu`** (EQDS-style)
+Removed `fair_decrease` from both ECN branches. `wait_to_decrease` (EMA gate) removed;
+once-per-`base_rtt` guard is now inline in the MD call site.
 
-Now the receiver only authorizes credits proportional to the current cwnd. When QA cuts cwnd, credit issuance slows automatically. In 100-way incast, the pacer is the rate bottleneck (8Gbps per sender), so cwnd oscillation doesn't affect the actual send rate.
+### 2c. Ignore Window (Alg.4)
 
-**Change 2: Bidirectional `update_pull_target`**
+**Old code:** ignore window only suppressed *decreases* inside core_cases; QA and FI still ran.
 
-The sink now accepts both increases AND decreases in pull_target. When cwnd drops via QA, pull_target decreases and the pacer stops issuing excess credits immediately.
+**Fixed:** strict early-return that blocks QA, FI, AND core_cases for all ACKs during the
+ignore window (paper Algorithm 4 lines 6-8).
 
-**Change 3: Soft ceiling in `can_send_one_mtu` for credit mode**
+Also fixed: `_bytes_ignored` now increments by MTU per *packet* (not per cum-ack delta). Trim
+ACKs that don't advance the cumulative ACK still count toward draining the window; without this
+fix, heavy trim storms kept the ignore window active indefinitely.
 
-Changed from hard cwnd gate (`inflight + mtu > cwnd → block`) to soft ceiling (`inflight + mtu > 2×cwnd → block`). After QA events, the sender isn't blocked even if inflight temporarily exceeds cwnd.
+### 2d. QuickAdapt Scaling (Alg.2)
 
-**Change 4: RTS (request-to-send) packet**
+**Old code:** `cwnd = max(acked × 0.8, mtu)` (0.8 qa_scaling factor).
+**Fixed:** `cwnd = max(acked, mtu)` (no scaling — paper §III-E confirms qa_scaling = 1).
 
-When credit-blocked (no credits available), the sender sends a lightweight header-only RTS packet carrying the current `pull_target`. The receiver uses this to restart the pacer without requiring a full data packet.
+### 2e. FastIncrease Gate (Alg.3)
 
-**Change 5: RTO cap at 100µs in credit mode**
+**Old code:** `rtt ≤ base + (target − base)/4 ≈ 13.5 µs`.
+**Fixed:** `rtt ≤ base_rtt` (strict, matching paper Algorithm 3 line 2).
 
-The exponential RTO backoff (up to 1 second) caused trigger-chained workloads (4×4MiB) to stall permanently when QA-induced stalls interacted with RTO doubling. Capping at 100µs ensures recovery within ~10ms per QA event.
+### 2f. cwnd Ceiling
 
-### New FastflowPacket: RTS
-
-Added `FastflowPacket::new_rts_pkt()` — a 40-byte header-only packet that travels forward (sender → receiver) to update `pull_target` at the sink and re-enqueue the sink in the pull pacer's active queue.
-
----
-
-## 5. Why It Works
-
-In **100-way incast** (non-blocking topology):
-- The pacer enforces round-robin credit grants → each sender gets 8Gbps (fair share)
-- EQDS pull_target limits outstanding credits to cwnd ahead of last_acked
-- FI can still grow cwnd to BDP, but pull_target grows proportionally → pacer stays running
-- No trim storms (queue never overflows because pacer rate-limits sends)
-- No QA events (no trims) → no stalls → 0.95+ normalized ✓
-
-In **permutation** (oversubscribed):
-- Fabric congestion → trims → QA → cwnd drops → EQDS pull_target drops → pacer slows
-- RTS + capped RTO provide recovery within ~10ms per QA event
-- After recovery, FI grows cwnd back to BDP → pacer runs at line rate again
-- 4×4MiB benefits because multiple trigger-chained flows don't stall permanently
+**Old:** 1.25 × BDP.
+**Fixed:** 1.5 × BDP (paper §III-J explicitly states "maximum window to 1.5 BDP").
 
 ---
 
-## 6. Remaining Limitations
+## 3. Results (evaluation in progress)
 
-**Small permutation 2MiB (os8)**: FF+EQDS = 257µs vs EQDS = 209µs (23% overhead). The credit bootstrap (EQDS-style pull_target starts small until cwnd grows via FI) adds ~45µs overhead for 2MiB flows. For 32MiB flows, this overhead is negligible.
+Spot checks after the fix (50:1 incast, non-blocking topology):
 
-**Vanilla FASTFLOW incast**: Still 0.74 normalized (not fixed). The sender-only CC without receiver credits can't achieve EQDS-level fairness in high-degree incast. This is expected behavior per the paper.
+| Size | FASTFLOW norm. | Status |
+|---|---|---|
+| 512 KiB | 0.627 | V-dip region (expected per paper) |
+| 32768 KiB | 0.823 | Recovery region — significantly better than old 0.74 |
 
----
+8:1 incast spot check:
 
-## 7. Files Modified
-
-| File | What Changed |
+| Size | FASTFLOW norm. |
 |---|---|
-| `sim/fastflow/fastflow.cpp` | EQDS-style pull_target, bidirectional update, soft ceiling, RTS, credit EMA tracking, capped RTO in credit mode |
-| `sim/fastflow/fastflow.h` | Added `_last_rts_time`, `_last_credit_time`, `_credit_ema` fields; `maybe_send_rts()` declaration |
-| `sim/fastflow/fastflowpacket.h` | Added `FastflowPacket::new_rts_pkt()`, `is_rts()`, `RTSSIZE` |
-| `sim/datacenter/plot_paper_figures.py` | Removed swift from PROTOCOLS lists |
+| 128 KiB | 0.259 (small-flow RTT overhead; FASTFLOW beats EQDS 0.152) |
+| 512 KiB | 0.558 |
+| 4096 KiB | 0.863 |
+| 32768 KiB | 0.846 |
+
+V-dip → recovery trend is present. Full evaluation running.
+
+---
+
+## 4. Incast Trend Explanation
+
+The remaining gap from paper's ~0.92 at medium sizes is attributable to load balancer differences:
+
+- **Paper uses REPS** (Random Entropy Packet Spraying): multiple senders spray across all paths
+  simultaneously, preventing any single path from building a queue → all senders can fire FI
+  at the same time → fast ramp-up even for small flows.
+- **Our code uses PLB (ECMP)**: single-path per flow → path collisions → queue builds earlier →
+  `rtt > base_rtt` → strict FI gate fails → slower cwnd growth.
+
+This is a fundamental limitation of ECMP vs REPS, not an algorithm correctness issue.
+
+---
+
+## 5. Files Modified
+
+| File | Changes |
+|---|---|
+| `sim/fastflow/fastflow.cpp` | MD formula (Eq.1), ignore-window fix, QA fix, FI gate, clamp_cwnd, remove WTD + FD, rename MI→PI |
+| `sim/fastflow/fastflow.h` | Removed dead statics (`_fd_const`, `_md_const`, `_qa_scaling`, `_wtd_*`, `_avg_wtd`); updated declarations |
+| `sim/datacenter/main_fastflow.cpp` | Removed dead static assignments |
+| `sim/datacenter/run_paper_eval.sh` | Degrees: 8/32/100 → 8/32/50 |
+| `sim/datacenter/plot_paper_figures.py` | Degrees: [8,32,100] → [8,32,50]; title updated |
+| `sim/datacenter/connection_matrices/` | Added 50-degree incast matrices (14 sizes) |

@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
     FastflowSrc::_enable_mcc = use_mcc;
     FastflowSrc::_trim_supported = trimming;
     FastflowSrc::_blast_start = blast_start;
-    if (!trimming) FastflowSrc::_md_const = 4.0;
+    // MD formula is now fully multiplicative (paper Eq.1); _md_const removed.
 
     CoflowRegistry::instance().reset();
     if (use_coflow) {
@@ -196,14 +196,9 @@ int main(int argc, char** argv) {
     FastflowSrc::_base_rtt   = brtt;
     FastflowSrc::_target_rtt = trtt;
     FastflowSrc::_bdp_bytes  = (uint32_t)bdp_bytes;
+    // fi scaled by gamma = bdp/reference_bdp so ramp-up time is topology-invariant.
     FastflowSrc::_fi_const   = 0.25 * gamma;
-    // mi is recomputed per-call inside multiplicative_increase but uses
-    // _base_rtt and _target_rtt which we just set.
-    FastflowSrc::_fd_const   = 0.8;
-    FastflowSrc::_md_const   = trimming ? 2.0 : 4.0;
-    FastflowSrc::_qa_scaling = 0.8;
-    FastflowSrc::_wtd_alpha  = 0.125;
-    FastflowSrc::_wtd_thresh = 0.25;
+    // pi constant is brtt/(trtt-brtt), computed per-call inside proportional_increase.
     FastflowSrc::_k_fastinc  = 2;
 
     cout << "[fastflow] brtt=" << timeAsUs(brtt) << "us trtt=" << timeAsUs(trtt) << "us"

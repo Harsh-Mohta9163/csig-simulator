@@ -88,22 +88,17 @@ public:
 
     // ====================== Global tunables (paper Sec 3.5) ================
     static uint16_t _mtu;          // MTU in bytes (data packet payload)
-    static double   _fd_const;     // Fair decrease constant (0.8)
-    static double   _fi_const;     // Fair increase constant (0.25 at 100Gbps ref)
-    static double   _md_const;     // Multiplicative decrease constant (2; 4 if no trim)
-    static double   _qa_scaling;   // QuickAdapt window scale (0.8)
-    static double   _wtd_alpha;    // EMA constant for WTD (0.125)
-    static double   _wtd_thresh;   // WTD trigger threshold (0.25)
-    static uint32_t _k_fastinc;    // packets per FastIncrease step (2)
+    static double   _fi_const;     // Fair increase constant fi (scaled by BDP ratio)
+    static uint32_t _k_fastinc;    // FastIncrease step = k × MTU  (paper k=2)
     static simtime_picosec _base_rtt;     // base RTT for the topology
-    static simtime_picosec _target_rtt;   // 1.5 * base_rtt (paper default)
+    static simtime_picosec _target_rtt;   // 1.5 × base_rtt (paper §III-J)
     static uint32_t _bdp_bytes;    // BDP in bytes for cwnd clamp
 
     // ====================== Feature toggles (CLI-driven) ===================
     static bool _enable_ra_qa;     // Idea 3: receiver-anchored QuickAdapt
     static bool _enable_credits;   // Idea 1: gate sends on receiver credits
     static bool _enable_mcc;       // Idea 1: message-level CC override
-    static bool _trim_supported;   // if false, double _md and rely on timeouts
+    static bool _trim_supported;   // if false, rely on timeouts instead of trimming
     static bool _blast_start;      // start cwnd at BDP and let trimming settle it
 
     // For workload-aware MCC: target bandwidth per flow (bytes/sec)
@@ -144,9 +139,8 @@ protected:
     uint32_t _cwnd;               // congestion window (bytes)
     uint64_t _acked;              // bytes acked in current QuickAdapt window
     uint64_t _bytes_ignored;      // accumulator for post-QA grace
-    uint64_t _bytes_to_ignore;    // ignore-budget after QuickAdapt fires
+    uint64_t _bytes_to_ignore;    // ignore-budget after QuickAdapt fires (= unacked at QA time)
     bool     _trigger_qa;         // a trim/timeout has armed QuickAdapt
-    double   _avg_wtd;            // EMA of ECN markings for Wait-to-Decrease
     uint32_t _fast_inc_count;     // bytes of clean ACKs in current FI window
     bool     _in_fast_inc;        // FastIncrease currently active
     simtime_picosec _qa_end;      // earliest time a new QuickAdapt may fire
@@ -202,13 +196,11 @@ protected:
 private:
     // --- Control loop (Algorithm 1) ---
     void handle_ack(FastflowAck& ack);
-    bool wait_to_decrease(bool ecn, simtime_picosec now);
     bool quick_adapt(FastflowAck& ack, simtime_picosec now);
     bool fast_increase(FastflowAck& ack);
-    void fair_decrease(uint16_t pkt_size);
-    void multiplicative_decrease(uint16_t pkt_size, simtime_picosec rtt_sample);
-    void fair_increase(uint16_t pkt_size);
-    void multiplicative_increase(uint16_t pkt_size, simtime_picosec rtt_sample);
+    void multiplicative_decrease();                          // paper Eq.1
+    void fair_increase(uint16_t pkt_size);                  // paper Eq.3
+    void proportional_increase(uint16_t pkt_size, simtime_picosec rtt_sample); // paper Eq.4
     void clamp_cwnd();
     void update_rtt(simtime_picosec sample);
 

@@ -159,7 +159,7 @@ def pstats(data):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_fig5_incast(results_dir, plots_dir):
-    degrees = [8, 32, 100]
+    degrees = [8, 32, 50]
     # Sizes matching paper x-axis: 2^2 to 2^15 KiB
     sizes_kib = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
@@ -172,7 +172,7 @@ def plot_fig5_incast(results_dir, plots_dir):
         fontsize=10
     )
 
-    degree_titles = {8: "8:1 Incast", 32: "32:1 Incast", 100: "100:1 Incast"}
+    degree_titles = {8: "8:1 Incast", 32: "32:1 Incast", 50: "50:1 Incast"}
 
     for ax_idx, deg in enumerate(degrees):
         ax = axes[ax_idx]
