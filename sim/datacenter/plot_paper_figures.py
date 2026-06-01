@@ -308,8 +308,8 @@ def plot_fig8_permutation(results_dir, plots_dir):
         },
         {
             "label": "(d)",
-            "title": "Bisect Perm. 8:1 OS · 2MiB + one 4MiB\n1024 Nodes · 800Gbps · 4KiB MTU",
-            "key": "perm_os8_2MiB_one4MiB",
+            "title": "Bisect Perm. 8:1 OS · 32MiB + one 64MiB\n1024 Nodes · 800Gbps · 4KiB MTU",
+            "key": "perm_os8_32MiB_one64MiB",
             "ms": False,
         },
     ]
